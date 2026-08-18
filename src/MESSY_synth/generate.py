@@ -84,11 +84,16 @@ class GeneratedDataset:
             the output without recomputing it.
         frames: One frame per source file, keyed by table prefix.
         timelines: The invented per-subject timelines, keyed by subject id.
+        truncated_metadata: Metadata prefixes whose key combinations exceeded
+            :data:`~MESSY_synth.plan.MAX_METADATA_ROWS`, mapped to how many were dropped. Codes
+            built from a dropped combination have no dictionary row, so this is surfaced as a
+            finding rather than left to a log line.
     """
 
     plan: DatasetPlan
     frames: dict[str, pl.DataFrame]
     timelines: dict[int, SubjectTimeline]
+    truncated_metadata: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> pl.DataFrame:
         """Return a one-row-per-file overview of what was generated.
@@ -196,13 +201,14 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
 
     joins = {t.input_prefix: t.join for t in cfg.event_tables if t.join is not None}
     frames: dict[str, pl.DataFrame] = {}
+    truncated: dict[str, int] = {}
     for table in _generation_order(plan, joins):
-        frame = _generate_table(table, plan, pools, timelines, subject_ids, options)
+        frame = _generate_table(table, plan, pools, timelines, subject_ids, options, truncated)
         join = joins.get(table.prefix)
         if join is not None and join.input_prefix in frames:
             frame = _adopt_join_keys(frame, table, join, frames[join.input_prefix], options)
         frames[table.prefix] = frame
-    return GeneratedDataset(plan=plan, frames=frames, timelines=timelines)
+    return GeneratedDataset(plan=plan, frames=frames, timelines=timelines, truncated_metadata=truncated)
 
 
 def _generation_order(plan: DatasetPlan, joins: dict) -> list[TablePlan]:
@@ -310,6 +316,7 @@ def _generate_table(
     timelines: dict[int, SubjectTimeline],
     subject_ids: list[int],
     options: GenerationOptions,
+    truncated: dict[str, int],
 ) -> pl.DataFrame:
     """Generate one file's frame.
 
@@ -320,12 +327,13 @@ def _generate_table(
         timelines: Per-subject timelines.
         subject_ids: The subject universe.
         options: The generation options.
+        truncated: Accumulator recording metadata tables whose key product hit the row cap.
 
     Returns:
         The generated frame.
     """
     if table.is_metadata:
-        return _generate_metadata_table(table, pools, options)
+        return _generate_metadata_table(table, pools, options, truncated)
 
     # The plan sizes tables from each pool's *requested* size, but a materialized pool can end up
     # longer — required values, coalesce fallbacks and regex-derived members are all added on top.
@@ -350,6 +358,7 @@ def _generate_metadata_table(
     table: TablePlan,
     pools: dict[str, list],
     options: GenerationOptions,
+    truncated: dict[str, int],
 ) -> pl.DataFrame:
     """Generate a ``_metadata`` dictionary file.
 
@@ -360,6 +369,7 @@ def _generate_metadata_table(
         table: The table plan.
         pools: Materialized pool values.
         options: The generation options.
+        truncated: Accumulator recording how many key combinations were dropped, if any.
 
     Returns:
         The generated frame.
@@ -375,6 +385,7 @@ def _generate_metadata_table(
         if len(combos) > MAX_METADATA_ROWS:
             # Say so rather than truncating quietly: the dropped combinations become codes with no
             # description, which is indistinguishable from a broken metadata join unless flagged.
+            truncated[table.prefix] = len(combos) - MAX_METADATA_ROWS
             logger.warning(
                 f"{table.prefix}: {len(combos)} key combinations exceeds the {MAX_METADATA_ROWS}-row "
                 f"cap; dropping {len(combos) - MAX_METADATA_ROWS}. Codes built from the dropped "
@@ -558,9 +569,10 @@ def _generate_temporal(
         if timeline is None:
             timeline = build_timeline(0, random.Random(f"anon:{i}"))
 
-        if constraint.temporal_role == "birth":
+        role = constraint.effective_temporal_role
+        if role == "birth":
             value = timeline.birth
-        elif constraint.temporal_role == "death":
+        elif role == "death":
             value = timeline.death
         else:
             value = timeline.sample(rng)
@@ -569,5 +581,5 @@ def _generate_temporal(
             out.append(None)
             continue
         rendered = format_datetime(value, constraint, i) if as_string else value
-        out.append(factory.maybe_null(rendered, constraint.nullable))
+        out.append(factory.maybe_null(rendered, constraint.effective_nullable))
     return out

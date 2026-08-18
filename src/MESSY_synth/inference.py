@@ -276,12 +276,25 @@ def _infer_table(table: TableConfig, cs: ConstraintSet) -> None:
                 continue
             expect = OUTPUT_SLOT_KINDS.get(slot, ValueKind.UNKNOWN)
             _visit(node, expect, ctx, cs, f"{event.name}.{slot}")
-            if role is not None and slot == "time":
+            if slot != "time":
+                continue
+            if role is not None:
                 _decorate(
                     node,
                     ctx,
                     cs,
                     ColumnConstraint(temporal_role=role).with_note(f"{event.name}: {role} timestamp"),
+                    frozenset(),
+                )
+            else:
+                # Record that this column times an ordinary event. If a birth/death role also
+                # lands on it, that role has to yield: generating the column from the subject's
+                # death date would null it for everyone who survives and gut this event too.
+                _decorate(
+                    node,
+                    ctx,
+                    cs,
+                    ColumnConstraint(plain_time=True).with_note(f"{event.name}: event timestamp"),
                     frozenset(),
                 )
 
@@ -461,7 +474,11 @@ def _visit(
                 _visit(when, ValueKind.BOOLEAN, ctx, cs, f"{note}: condition", seen)
             for branch in ("then", "otherwise"):
                 if (b := node.kwargs.get(branch)) is not None:
-                    _visit(b, expect, ctx, cs, note, seen)
+                    # Forward the range hint, as Coalesce does: a conditional is a value-carrying
+                    # wrapper, so `($y - $a)::str ... ::year` must be typed the same whether it is
+                    # wrapped in `??` or in `if/else`. Dropping it silently reverts the year
+                    # arithmetic to the default 1-100 range and voids every birth event.
+                    _visit(b, expect, ctx, cs, note, seen, range_hint)
 
         case RegexMatch() | RegexExtract():
             pattern = _literal_value(node.kwargs.get("pattern"))

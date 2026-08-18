@@ -98,6 +98,10 @@ class ColumnConstraint:
             needs at least 3 characters) and from ``len_chars($col) > n`` comparisons.
         nullable: Whether the column may contain nulls. Set False for columns whose nullity would
             break the run outright — subject ids and join keys.
+        plain_time: True when this column supplies the timestamp of an *ordinary* (non-birth,
+            non-death) event. It suppresses :attr:`temporal_role`: a column doing double duty
+            cannot be placed on the timeline as a death date, because a death date is null for
+            every subject who does not die, which would empty the ordinary event too.
         subject_key: True when this column is the *input* to a ``hash()``/``signed_hash()`` that
             produces the subject id. Such a column is not itself a subject id — it can be any text
             — but it stands in one-to-one for a subject, so its pool must be sized by the requested
@@ -158,6 +162,7 @@ class ColumnConstraint:
     min_chars: int = 0
     nullable: bool = True
     strict_parse: bool = False
+    plain_time: bool = False
     subject_key: bool = False
     temporal_role: str | None = None
     notes: tuple[str, ...] = ()
@@ -197,10 +202,32 @@ class ColumnConstraint:
             min_chars=max(self.min_chars, other.min_chars),
             nullable=self.nullable and other.nullable,
             strict_parse=self.strict_parse or other.strict_parse,
+            plain_time=self.plain_time or other.plain_time,
             subject_key=self.subject_key or other.subject_key,
             temporal_role=self.temporal_role or other.temporal_role,
             notes=_ordered_union(self.notes, other.notes),
         )
+
+    @property
+    def effective_temporal_role(self) -> str | None:
+        """The birth/death role to actually generate by, or None.
+
+        A role is dropped when the same column also supplies an ordinary event's timestamp. HiRID
+        does exactly this: ``date_of_death: '$datetime if $_died'`` bottoms out in the same
+        ``datetime`` column that its main observation table reads. Honouring the role there would
+        fill that column from each subject's death date — null for everyone who survives — and
+        silently delete most of the largest table in the dataset.
+
+        Returns:
+            ``"birth"``, ``"death"``, or None.
+
+        Examples:
+            >>> ColumnConstraint(temporal_role="death").effective_temporal_role
+            'death'
+            >>> ColumnConstraint(temporal_role="death", plain_time=True).effective_temporal_role is None
+            True
+        """
+        return None if self.plain_time else self.temporal_role
 
     @property
     def effective_nullable(self) -> bool:
@@ -219,8 +246,13 @@ class ColumnConstraint:
             False
             >>> ColumnConstraint(nullable=False, temporal_role="death").effective_nullable
             True
+
+            Unless the role was suppressed because the column also times an ordinary event:
+
+            >>> ColumnConstraint(nullable=False, temporal_role="death", plain_time=True).effective_nullable
+            False
         """
-        return self.nullable or self.temporal_role == "death"
+        return self.nullable or self.effective_temporal_role == "death"
 
     def with_note(self, note: str) -> ColumnConstraint:
         """Return a copy carrying one more provenance line.

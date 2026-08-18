@@ -283,3 +283,39 @@ def test_a_plain_join_does_not_fan_out(tmp_path):
     joined = next(t for t in cfg.event_tables if t.input_prefix == "diagnoses").scan(tmp_path).collect()
     assert joined.height == diagnoses.height, f"{diagnoses.height} rows fanned out to {joined.height}"
     assert joined["dischtime"].null_count() == 0, "every join key should resolve on the far side"
+
+
+#: One column times both an ordinary event and MEDS_DEATH — the shape that lets a death role
+#: contaminate a column that most subjects must still have a value for.
+SHARED_TIME_CONFIG = {
+    "etl": {"dataset_name": "SharedTime", "raw_dataset_version": "1"},
+    "adm": {
+        "_defaults": {"subject_id": "$pid"},
+        "_table": {
+            "cols": {
+                "_disch": '$dischtime::"%Y-%m-%d %H:%M:%S"',
+                "_died": '$status != "alive"',
+                "dod": "$_disch if $_died",
+            }
+        },
+        "admission": {"code": "HOSPITAL_ADMISSION", "time": '$admittime::"%Y-%m-%d %H:%M:%S"'},
+        "discharge": {"code": "HOSPITAL_DISCHARGE", "time": "$_disch"},
+        "death": {"code": "MEDS_DEATH", "time": "$dod"},
+    },
+}
+
+
+def test_a_death_role_does_not_empty_a_column_shared_with_an_ordinary_event(tmp_path):
+    """A column timing both a normal event and MEDS_DEATH is generated as a normal timestamp.
+
+    Birth and death timestamps are placed on the subject's timeline rather than sampled, and a
+    death date is null for every subject who survives. When the config routes an ordinary event's
+    timestamp through the same raw column — HiRID does, via ``date_of_death: '$datetime if $_died'``
+    — honouring the death role would null that column for most subjects and silently delete most of
+    the ordinary event's rows, while every check still reported success.
+    """
+    cfg = MessyConfig.parse(SHARED_TIME_CONFIG)
+    result = synthesize(cfg, tmp_path, n_subjects=20, rows_per_subject=1, seed=0, null_fraction=0.0)
+    assert result.dataset.frames["adm"]["dischtime"].null_count() == 0
+    yields = {row["event"]: row["rows_out"] for row in result.events.iter_rows(named=True)}
+    assert yields["discharge"] == yields["admission"] == 20, yields

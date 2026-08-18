@@ -15,14 +15,13 @@ from typing import TYPE_CHECKING
 from MEDS_extract.config import MessyConfig
 
 from .generate import GenerationOptions, generate
-from .validate import check_plan, dry_run, findings_from_dry_run, recommended_n_subjects
+from .validate import Finding, check_plan, dry_run, findings_from_dry_run, recommended_n_subjects
 from .writer import resolve_format, write_dataset
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import polars as pl
 
     from .generate import GeneratedDataset
-    from .validate import Finding
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +153,15 @@ def synthesize(
     output_dir = Path(output_dir)
     files = write_dataset(dataset, output_dir, resolved)
 
-    findings: list[Finding] = []
+    findings: list[Finding] = [
+        Finding(
+            "warning",
+            prefix,
+            f"{dropped} key combination(s) dropped at the metadata row cap; codes built from them "
+            f"will have no description. Lower vocab_size to fit.",
+        )
+        for prefix, dropped in sorted(dataset.truncated_metadata.items())
+    ]
     events = None
     if validate:
         findings.extend(check_plan(cfg, dataset.plan, resolved))

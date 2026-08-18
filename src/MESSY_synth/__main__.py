@@ -186,8 +186,8 @@ def explain(result) -> str:
             extras = []
             if c.datetime_formats:
                 extras.append("fmt=" + ",".join(c.datetime_formats))
-            if c.temporal_role:
-                extras.append(f"role={c.temporal_role}")
+            if c.effective_temporal_role:
+                extras.append(f"role={c.effective_temporal_role}")
             if column.pool_id:
                 extras.append("shared-pool" + (" (covering)" if column.covers_pool else ""))
             if not c.effective_nullable:
