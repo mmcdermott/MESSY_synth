@@ -199,10 +199,10 @@ configs available at the time of writing:
 | ETL                  | Result                 | Output from synthetic input                                                                     |
 | -------------------- | ---------------------- | ----------------------------------------------------------------------------------------------- |
 | MEDS-Extract example | pass                   | 185 events, 16 subjects, 64 codes (40 described)                                                |
-| MIMIC-IV             | pass                   | 7,307 events, 40 subjects, 635 codes (312 described)                                            |
-| NWICU                | pass                   | 2,952 events, 40 subjects, 275 codes (130 described)                                            |
+| MIMIC-IV             | pass                   | 2,827 events, 40 subjects, 635 codes (312 described)                                            |
+| NWICU                | pass                   | 1,447 events, 40 subjects, 275 codes (130 described)                                            |
 | SICdb                | pass                   | 851 events, 40 subjects, 250 codes                                                              |
-| AmsterdamUMCdb       | pass                   | 5,758 events, 40 subjects, 731 codes                                                            |
+| AmsterdamUMCdb       | pass                   | 1,294 events, 40 subjects, 711 codes                                                            |
 | HiRID                | **fails — config bug** | `raw_stage/observation_tables.datetime` is read both via `strptime` and directly as a timestamp |
 | INSPIRE              | **fails — config bug** | `operations` declares a self-join, which MEDS-Extract 0.7 rejects                               |
 

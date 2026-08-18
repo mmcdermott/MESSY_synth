@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 #: MEDS-Transforms' split fractions when a config declares none.
 DEFAULT_SPLIT_FRACS = {"train": 0.8, "tuning": 0.1, "held_out": 0.1}
 
+#: Expected subject count below which the rarest split can round away to nothing.
+#: ``split_and_shard_subjects`` permutes the split names before rounding, so a cohort near this
+#: boundary fails for some seeds and passes for others; below it, failure is the common case.
+MIN_RAREST_SPLIT_MASS = 0.5
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -119,7 +124,7 @@ def recommended_n_subjects(cfg: MessyConfig) -> int:
         >>> recommended_n_subjects(even)
         16
     """
-    fracs = [f for f in split_fracs(cfg).values() if f > 0]
+    fracs = [f for f in split_fracs(cfg).values() if isinstance(f, int | float) and f > 0]
     if not fracs:
         return 10
     return max(10, math.ceil(4 / min(fracs)))
@@ -147,13 +152,22 @@ def check_plan(cfg: MessyConfig, plan: DatasetPlan, fmt: str = "csv") -> list[Fi
         >>> check_plan(cfg, build_plan(cfg, n_subjects=40))
         []
 
-        Too few subjects for the configured splits is an error, not a warning: the run fails for
-        some seeds and passes for others, which is worse than failing outright.
+        A cohort so small that the rarest split rounds away to nothing is an error — the run then
+        fails for some seeds and passes for others, which is worse than failing outright:
 
-        >>> for f in check_plan(cfg, build_plan(cfg, n_subjects=5)):
+        >>> for f in check_plan(cfg, build_plan(cfg, n_subjects=3)):
         ...     print(f)
-        ERROR    config: 5 subjects is too few for split_fracs {'train': 0.8, 'tuning': 0.1,
-        'held_out': 0.1}; the rarest split rounds to 0 for some seeds. Use at least 40.
+        ERROR    config: 3 subjects is too few for split_fracs {'train': 0.8, 'tuning': 0.1,
+        'held_out': 0.1}: the rarest split gets 0.30 subjects and will round to zero. Use at
+        least 40.
+
+        A cohort that will populate every split but leaves them thin is only advisory, so a
+        deliberately small run is not blocked:
+
+        >>> for f in check_plan(cfg, build_plan(cfg, n_subjects=8)):
+        ...     print(f)
+        WARNING  config: 8 subjects leaves the rarest split with about 0.8 subjects. It will
+        populate, but 40 would give every split a usable size.
 
         Writing a bare timestamp column to CSV is flagged, because polars' CSV inference will
         deliver it as a string and the run will fail at extraction:
@@ -194,14 +208,27 @@ def check_plan(cfg: MessyConfig, plan: DatasetPlan, fmt: str = "csv") -> list[Fi
     """
     findings: list[Finding] = []
 
+    fracs = [f for f in split_fracs(cfg).values() if isinstance(f, int | float) and f > 0]
+    rarest = min(fracs) if fracs else 1.0
     recommended = recommended_n_subjects(cfg)
-    if plan.n_subjects < recommended:
+    if plan.n_subjects * rarest < MIN_RAREST_SPLIT_MASS:
         findings.append(
             Finding(
                 "error",
                 "config",
-                f"{plan.n_subjects} subjects is too few for split_fracs {split_fracs(cfg)}; "
-                f"the rarest split rounds to 0 for some seeds. Use at least {recommended}.",
+                f"{plan.n_subjects} subjects is too few for split_fracs {split_fracs(cfg)}: the "
+                f"rarest split gets {plan.n_subjects * rarest:.2f} subjects and will round to zero. "
+                f"Use at least {recommended}.",
+            )
+        )
+    elif plan.n_subjects < recommended:
+        findings.append(
+            Finding(
+                "warning",
+                "config",
+                f"{plan.n_subjects} subjects leaves the rarest split with about "
+                f"{plan.n_subjects * rarest:.1f} subjects. It will populate, but "
+                f"{recommended} would give every split a usable size.",
             )
         )
 
@@ -260,6 +287,10 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
     Args:
         cfg: The parsed MESSY config.
         input_dir: Directory holding the generated source files.
+
+    ``rows_out`` counts *source rows that would yield an event*, which is what matters for
+    catching silent emptiness. It is an upper bound on the events finally written: extraction ends
+    with ``.unique()``, so rows producing byte-identical events collapse into one.
 
     Returns:
         One row per event, with ``table``, ``event``, ``rows_in``, ``rows_out``, and ``error``.
@@ -320,16 +351,32 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
             }
             try:
                 exprs = event.polars_exprs
-                out = frame.select(
-                    code=exprs["code"].alias("code"),
-                    time=exprs.get("time", pl.lit(None, dtype=pl.Datetime)).alias("time"),
-                )
+                # `with_columns`, not `select`: an event whose code and time are both literals
+                # (`code: MEDS_BIRTH, time: null`) selects to a single broadcast row, which would
+                # report one event where the ETL emits one per source row.
+                out = frame.with_columns(
+                    _code=exprs["code"],
+                    _time=exprs.get("time", pl.lit(None, dtype=pl.Datetime)),
+                ).select(code=pl.col("_code"), time=pl.col("_time"))
                 # A null code drops the row outright. A null *time* also drops it, but only for a
                 # timed event — a static event (`time: null`) is null-timed by definition. Counting
                 # code alone would overstate the yield of, say, a `MEDS_DEATH` event whose
                 # timestamp is null for every surviving subject.
                 keep = pl.col("code").is_not_null()
                 if not event.is_static:
+                    # Reproduce `EventConfig.extract`'s dtype guard. A timed event whose `time`
+                    # expression is not temporally typed aborts the real run, but evaluating the
+                    # expression here succeeds — so without this check the dry run reports a healthy
+                    # row count for a config that cannot run at all. HiRID is exactly this case: one
+                    # raw column read as a string in one table and as a timestamp in another.
+                    time_dtype = out.schema["time"]
+                    if time_dtype != pl.Null and not isinstance(time_dtype, pl.Datetime | pl.Date):
+                        record["error"] = (
+                            f"the `time` expression produced dtype {time_dtype}, not a "
+                            f"date/datetime. MEDS-Extract rejects this at extraction."
+                        )
+                        rows.append(record)
+                        continue
                     keep = keep & pl.col("time").is_not_null()
                 record["rows_out"] = int(out.select(keep.sum()).item())
             except Exception as e:

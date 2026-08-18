@@ -194,11 +194,91 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
         for sid in subject_ids
     }
 
-    frames = {
-        table.prefix: _generate_table(table, plan, pools, timelines, subject_ids, options)
-        for table in plan.tables
-    }
+    joins = {t.input_prefix: t.join for t in cfg.event_tables if t.join is not None}
+    frames: dict[str, pl.DataFrame] = {}
+    for table in _generation_order(plan, joins):
+        frame = _generate_table(table, plan, pools, timelines, subject_ids, options)
+        join = joins.get(table.prefix)
+        if join is not None and join.input_prefix in frames:
+            frame = _adopt_join_keys(frame, table, join, frames[join.input_prefix], options)
+        frames[table.prefix] = frame
     return GeneratedDataset(plan=plan, frames=frames, timelines=timelines)
+
+
+def _generation_order(plan: DatasetPlan, joins: dict) -> list[TablePlan]:
+    """Order tables so every join target is built before the table that joins to it.
+
+    Join keys are not invented independently on the two sides — the referencing table copies real
+    key tuples out of the target's finished frame — so the target has to exist first.
+
+    Args:
+        plan: The dataset plan.
+        joins: Table prefix to its :class:`~MEDS_extract.config.JoinConfig`.
+
+    Returns:
+        The table plans in dependency order. A cycle (which MEDS-Extract rejects for self-joins,
+        but could in principle span tables) degrades to the plan's own order rather than hanging.
+    """
+    by_prefix = {t.prefix: t for t in plan.tables}
+    ordered: list[TablePlan] = []
+    placed: set[str] = set()
+
+    def visit(prefix: str, seen: frozenset[str]) -> None:
+        if prefix in placed or prefix in seen or prefix not in by_prefix:
+            return
+        join = joins.get(prefix)
+        if join is not None:
+            visit(join.input_prefix, seen | {prefix})
+        if prefix not in placed:
+            placed.add(prefix)
+            ordered.append(by_prefix[prefix])
+
+    for table in plan.tables:
+        visit(table.prefix, frozenset())
+    return ordered
+
+
+def _adopt_join_keys(
+    frame: pl.DataFrame,
+    table: TablePlan,
+    join,
+    target: pl.DataFrame,
+    options: GenerationOptions,
+) -> pl.DataFrame:
+    """Replace a table's join-key columns with real key tuples drawn from the target's frame.
+
+    Generating the two sides independently is not good enough for a composite key: each column
+    might individually come from the right pool while the *combination* exists nowhere on the far
+    side, so almost every row dangles and is silently dropped. Copying whole tuples from the target
+    makes every left key resolve by construction, for composite and single keys alike.
+
+    The subject column is exempt. It already agrees across tables by drawing from the shared subject
+    universe, and overwriting it would break the round-robin assignment that gives every subject a
+    row — and, in a subject-level table, would put two rows on one subject.
+
+    Args:
+        frame: The freshly generated frame.
+        table: Its plan.
+        join: The table's join config.
+        target: The already-generated frame of the join target.
+        options: The generation options, for the seed.
+
+    Returns:
+        The frame with its join keys adopted from the target.
+    """
+    pairs = [
+        (left, right)
+        for left, right in zip(join.left_on, join.right_on, strict=True)
+        if left != table.subject_column and left in frame.columns and right in target.columns
+    ]
+    if not pairs or target.height == 0:
+        return frame
+
+    rng = random.Random(f"{options.seed}:joinkeys:{table.prefix}")
+    picks = [rng.randrange(target.height) for _ in range(frame.height)]
+    return frame.with_columns(
+        *(target[right].gather(picks).alias(left) for left, right in pairs),
+    )
 
 
 def _materialize_pools(plan: DatasetPlan, options: GenerationOptions) -> dict[str, list]:
@@ -360,6 +440,11 @@ def _generate_column(
         # already chosen for that subject.
         pool = pools[column.pool_id]
         return [pool[(subject - 1) % len(pool)] for subject in row_subjects]
+
+    if column.unique_in_table:
+        # One distinct value per row: a repeated key on the target side of a plain left join fans
+        # the join out, turning one referencing row into many.
+        return [factory.token(column.name, i, constraint.min_chars) for i in range(n_rows)]
 
     if column.pool_id is not None:
         pool = pools[column.pool_id]

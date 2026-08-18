@@ -229,8 +229,11 @@ def write_dataset(
         path.parent.mkdir(parents=True, exist_ok=True)
         if resolved == "parquet":
             frame.write_parquet(path)
+        elif resolved == "csv.gz":
+            # polars does not infer compression from the extension — it raises if the name implies
+            # one and `compression` does not say so.
+            frame.write_csv(path, compression="gzip")
         else:
-            # `write_csv` gzips automatically for a .csv.gz destination.
             frame.write_csv(path)
         written[table.prefix] = path
         logger.info(f"Wrote {frame.height} rows x {frame.width} cols to {path}")

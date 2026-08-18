@@ -237,6 +237,18 @@ def _infer_table(table: TableConfig, cs: ConstraintSet) -> None:
                 _visit(
                     ctx.derived[left], ValueKind.IDENTIFIER, ctx, cs, f"join key -> {table.join.input_prefix}"
                 )
+                # The canonical composite idiom restricts a join with a literal key
+                # (`cols: {drug_type: "'MAIN'"}`). That literal has to occur on the target side or
+                # the join matches nothing at all.
+                literal = _literal_value(ctx.derived[left])
+                if literal is not None:
+                    cs.observe(
+                        table.join.input_prefix,
+                        right,
+                        ColumnConstraint(required_values=(str(literal),)).with_note(
+                            f"filtered to {literal!r} by {table.input_prefix}"
+                        ),
+                    )
             else:
                 cs.observe(
                     table.input_prefix,

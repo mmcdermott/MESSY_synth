@@ -252,3 +252,34 @@ def test_a_config_meds_extract_rejects_is_reported_not_raised(tmp_path):
     assert any("could not be loaded" in f.message and "ops" in f.message for f in result.findings), (
         result.findings
     )
+
+
+#: A plain (non-aggregated) join to a table that also carries its own events — the shape that makes
+#: a repeated key on the target side fan the join out.
+FANOUT_CONFIG = {
+    "etl": {"dataset_name": "Fanout", "raw_dataset_version": "1"},
+    "_defaults": {"subject_id": "$pid"},
+    "admissions": {
+        "admit": {"code": "ADMIT", "time": '$admittime::"%Y-%m-%d"'},
+    },
+    "diagnoses": {
+        "_table": {"join": {"admissions": {"key": "hadm_id", "cols": ["dischtime"]}}},
+        "dx": {"code": 'f"DX//{$icd}"', "time": '$dischtime::"%Y-%m-%d"'},
+    },
+}
+
+
+def test_a_plain_join_does_not_fan_out(tmp_path):
+    """A join to an event-bearing target preserves the referencing table's row count.
+
+    MEDS-Extract uses a plain left join. If the target's key repeats — which it will whenever the target has
+    many rows and the key is drawn from a small pool — one referencing row becomes many, each carrying a
+    different arbitrary right-hand row. The event count inflates and rows get attributed to whichever
+    admission happened to sort first, with no error anywhere.
+    """
+    cfg = MessyConfig.parse(FANOUT_CONFIG)
+    result = synthesize(cfg, tmp_path, n_subjects=16, rows_per_subject=4, seed=0)
+    diagnoses = result.dataset.frames["diagnoses"]
+    joined = next(t for t in cfg.event_tables if t.input_prefix == "diagnoses").scan(tmp_path).collect()
+    assert joined.height == diagnoses.height, f"{diagnoses.height} rows fanned out to {joined.height}"
+    assert joined["dischtime"].null_count() == 0, "every join key should resolve on the far side"

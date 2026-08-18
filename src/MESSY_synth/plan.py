@@ -136,12 +136,18 @@ class ColumnPlan:
         covers_pool: When True, this column enumerates its pool so that every pool value appears at
             least once. Set for the right-hand side of a join and for metadata key columns, where a
             missing value would leave referencing rows unmatched.
+        unique_in_table: When True, every row must hold a distinct value. Set for the right-hand
+            key of a *non-aggregated* join: MEDS-Extract joins are plain left joins, so a duplicated
+            key on the target side fans the join out — one left row becomes many, each carrying a
+            different arbitrary right row. An aggregated join collapses duplicates itself and does
+            not need this.
     """
 
     name: str
     constraint: ColumnConstraint
     pool_id: str | None = None
     covers_pool: bool = False
+    unique_in_table: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,18 +266,18 @@ def build_plan(
         >>> plan.table("labs").n_rows
         40
 
-        ``stays`` exists only because ``labs`` joins to it. It is sized to cover the key pool, and
-        its key column enumerates that pool so no ``labs`` row dangles:
+        ``stays`` exists only because ``labs`` joins to it. It is sized like an event table rather
+        than by its key pool, so every subject actually gets stays for ``labs`` to hang off:
 
         >>> stays = plan.table("stays")
-        >>> key = next(c for c in stays.columns if c.name == "stay_id")
-        >>> key.covers_pool, stays.n_rows == plan.pools[key.pool_id].size
-        (True, True)
+        >>> stays.kind, stays.n_rows
+        ('join-target', 40)
 
-        Both sides of the join share one pool, which is what makes the join land:
+        Its key is marked unique-per-row. ``labs`` joins it without an aggregation, so a repeated
+        ``stay_id`` on this side would fan the left join out — one lab row becoming many, each
+        carrying a different arbitrary stay:
 
-        >>> labs_key = next(c for c in plan.table("labs").columns if c.name == "stay_id")
-        >>> labs_key.pool_id == key.pool_id
+        >>> next(c for c in stays.columns if c.name == "stay_id").unique_in_table
         True
 
         Every subject column across every table shares the single subject universe:
@@ -292,6 +298,7 @@ def build_plan(
     _link_identifiers_by_name(cfg, source_columns, uf)
 
     covering = _covering_columns(cfg, metadata)
+    unique_keys = _unique_key_columns(cfg)
     pools = _build_pools(constraints, source_columns, metadata, uf, n_subjects, vocab_size)
 
     tables: list[TablePlan] = []
@@ -305,6 +312,7 @@ def build_plan(
                 uf=uf,
                 pools=pools,
                 covering=covering,
+                unique_keys=unique_keys,
                 n_subjects=n_subjects,
                 rows_per_subject=rows_per_subject,
                 is_metadata=False,
@@ -320,6 +328,7 @@ def build_plan(
                 uf=uf,
                 pools=pools,
                 covering=covering,
+                unique_keys=unique_keys,
                 n_subjects=n_subjects,
                 rows_per_subject=rows_per_subject,
                 is_metadata=True,
@@ -520,6 +529,32 @@ def _link_identifiers_by_name(
                 uf.union((f"__name__{column}", column), (prefix, column))
 
 
+def _unique_key_columns(cfg: MessyConfig) -> set[tuple[str, str]]:
+    """Return target-side join keys that must be unique within their table.
+
+    A non-aggregated join to a target whose key repeats produces a cartesian explosion: MEDS-Extract
+    uses a plain left join, so a left row matching *k* right rows becomes *k* rows, each carrying a
+    different right-hand value. On synthetic data that silently multiplies the event count and
+    attributes rows to whichever admission happened to sort first.
+
+    Args:
+        cfg: The parsed MESSY config.
+
+    Returns:
+        ``(prefix, column)`` pairs that must hold distinct values per row.
+    """
+    unique: set[tuple[str, str]] = set()
+    for table in cfg.event_tables:
+        join = table.join
+        if join is None or join.aggregations:
+            continue
+        # One unique column is enough to make the whole tuple unique. Forcing every column would
+        # break the canonical composite idiom, where a second key is a literal used to *filter* the
+        # target (`cols: {drug_type: "'MAIN'"}`) and must therefore repeat.
+        unique.add((join.input_prefix, join.right_on[0]))
+    return unique
+
+
 def _covering_columns(cfg: MessyConfig, metadata: dict[str, _MetadataLayout]) -> set[tuple[str, str]]:
     """Return the columns that must enumerate their whole pool.
 
@@ -654,6 +689,7 @@ def _plan_table(
     uf: UnionFind,
     pools: dict[str, ValuePool],
     covering: set[tuple[str, str]],
+    unique_keys: set[tuple[str, str]],
     n_subjects: int,
     rows_per_subject: int,
     is_metadata: bool,
@@ -669,6 +705,7 @@ def _plan_table(
         uf: The populated union-find.
         pools: The materialized pools.
         covering: Columns that must enumerate their pool.
+        unique_keys: Columns that must hold a distinct value per row.
         n_subjects: The subject-universe size.
         rows_per_subject: Rows per subject for timed event tables.
         is_metadata: Whether this is a ``_metadata`` dictionary file.
@@ -690,6 +727,7 @@ def _plan_table(
                 constraint=constraint,
                 pool_id=pool_id,
                 covers_pool=(prefix, name) in covering,
+                unique_in_table=(prefix, name) in unique_keys and name != subject_column,
             )
         )
 
@@ -706,11 +744,13 @@ def _plan_table(
     else:
         subject_level = _is_subject_level(cfg, prefix)
         if not has_events:
-            # A pure join target — a dimension table that exists only to be looked up. It needs one
-            # row per key value and nothing more; extra rows would just be unreachable.
+            # A pure join target — a dimension table that exists only to be looked up. Size it like
+            # an event table rather than by its key pool: a `stays` table with only `vocab_size`
+            # rows would mean only that many subjects ever appear in the tables that join to it,
+            # regardless of how many subjects were requested.
             n_rows = max(
-                (pools[c.pool_id].size for c in columns if c.covers_pool and c.pool_id),
-                default=n_subjects,
+                [n_subjects * rows_per_subject]
+                + [pools[c.pool_id].size for c in columns if c.covers_pool and c.pool_id]
             )
         else:
             n_rows = n_subjects if subject_level else n_subjects * rows_per_subject
