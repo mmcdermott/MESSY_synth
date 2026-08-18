@@ -71,6 +71,12 @@ def generate_match(pattern: str, rng: Random, attempts: int = 12) -> str | None:
         >>> agegroup.isdigit() and len(agegroup) == 2
         True
 
+        A quantified *group* repeats the whole group, literals included — resampling only the last
+        character class would silently drop the ``AB``:
+
+        >>> generate_match(r"(AB\d){2}", random.Random(0))
+        'AB6AB4'
+
         Anchors contribute no characters:
 
         >>> generate_match("^E", rng)
@@ -198,31 +204,32 @@ class _Generator:
         return "".join(parts)
 
     def _quantified(self) -> str:
-        """Parse one atom plus any quantifier that follows it.
+        r"""Parse one atom plus any quantifier that follows it.
+
+        Each repetition re-parses the atom from its original position rather than resampling a
+        remembered alphabet. That distinction matters for a *composite* atom: resampling the last
+        character class seen would turn ``(AB\d){2}`` into two bare digits, dropping the ``AB``
+        entirely, while re-parsing reproduces the whole group. It also keeps ``\d{4}`` from coming
+        out as ``1111``.
 
         Returns:
             The generated text, repeated as the quantifier requires.
         """
-        atom = self._atom()
+        start = self.pos
+        first = self._atom()
         low, high = self._quantifier()
+        after = self.pos
         if low == 1 and high == 1:
-            return atom
+            return first
         count = self.rng.randint(low, high)
-        # Re-generate per repetition where the atom is variable, so `\d{4}` is not `1111`.
-        return "".join(self._regenerate(atom) for _ in range(count))
-
-    def _regenerate(self, atom: str) -> str:
-        """Return a fresh sample for a repeated atom.
-
-        Args:
-            atom: The previously generated text, used when the atom cannot be resampled.
-
-        Returns:
-            The text to emit for this repetition.
-        """
-        if getattr(self, "_last_alphabet", None):
-            return self.rng.choice(self._last_alphabet)
-        return atom
+        if count == 0:
+            return ""
+        parts = [first]
+        for _ in range(count - 1):
+            self.pos = start
+            parts.append(self._atom())
+        self.pos = after
+        return "".join(parts)
 
     def _quantifier(self) -> tuple[int, int]:
         """Parse a quantifier suffix, if present.
@@ -275,7 +282,6 @@ class _Generator:
         Raises:
             _UnsupportedPatternError: On lookarounds, backreferences, or other unmodeled syntax.
         """
-        self._last_alphabet = ""
         ch = self._peek()
         if ch is None:
             raise _UnsupportedPatternError("unexpected end of pattern")
@@ -292,7 +298,6 @@ class _Generator:
             return self._escape()
         if ch == ".":
             self.pos += 1
-            self._last_alphabet = _DEFAULT_ALPHABET
             return self.rng.choice(_DEFAULT_ALPHABET)
         self.pos += 1
         return ch
@@ -362,7 +367,6 @@ class _Generator:
             alphabet = "".join(c for c in _DEFAULT_ALPHABET if c not in alphabet)
         if not alphabet:
             raise _UnsupportedPatternError("empty character class")
-        self._last_alphabet = alphabet
         return self.rng.choice(alphabet)
 
     def _escape(self) -> str:
@@ -372,7 +376,6 @@ class _Generator:
             The generated character.
         """
         alphabet = self._escape_alphabet()
-        self._last_alphabet = alphabet
         return self.rng.choice(alphabet)
 
     def _escape_alphabet(self) -> str:

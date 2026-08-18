@@ -368,7 +368,7 @@ def _pattern_values(patterns: tuple[str, ...], count: int, rng: Random, *, match
 
     Examples:
         >>> _pattern_values((r"^\d{2}$",), 2, random.Random(1), match=True)
-        ['41', '63']
+        ['24', '77']
         >>> _pattern_values(("^E",), 1, random.Random(1), match=False)
         ['NOMATCH000']
     """
