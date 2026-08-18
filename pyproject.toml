@@ -3,57 +3,73 @@ requires = ["setuptools>=80.9.0", "setuptools-scm>=9.2", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "package_name"
+name = "MESSY_synth"
 dynamic = ["version"] # Makes setuptools-scm manage the version
 authors = [
-  {name="Matthew McDermott", email="mattmcdermott8@gmail.com"}, # Replace with your team's details
+  {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
 ]
-description = "Add your description here"
+description = "Generate structurally-faithful synthetic raw data from any MEDS-Extract v0.7 MESSY config."
 readme = "README.md"
 requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License", # Change if not using MIT license
+    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-] # Add your runtime dependencies here
+  # 0.7.0 is the first release with the single-file MESSY config and the
+  # `MessyConfig`/`TableConfig`/`EventConfig` API this package reflects over.
+  "MEDS-extract>=0.7.0,<0.8",
+  # The expression DSL whose AST we walk to infer column types. Pulled in
+  # transitively by MEDS-extract, but imported directly here, so declared direct.
+  "dftly>=0.7.0,<0.8",
+  "polars>=1.38",
+]
 
 [dependency-groups]
 dev = [
-  "pre-commit<4", "ruff", "pytest", "pytest-cov", "pretty-print-directory",
+  "pre-commit<4",
+  "ruff",
+  "pytest",
+  "pytest-cov",
+  "pretty-print-directory",
+  "yaml_to_disk",
   # shfmt-py bundles the `shfmt` binary used by the mdformat-shfmt pre-commit
   # hook. Pinning it here (in addition to the pre-commit hook's
   # additional_dependencies) gives a single source of truth and keeps local
   # `uv run mdformat ...` runs consistent with CI pre-commit runs.
   "shfmt-py==3.12.0.2",
-] # Add your development (lint, test) dependencies here
-docs = [] # Add your documentation dependencies here (I recommend mkdocs-material)
+  "pyyaml>=6.0.2",
+]
+docs = []
 
-[tool.setuptools_scm] # Required for setuptools-scm to work, even if empty
+[tool.setuptools_scm]
 
-[project.optional-dependencies] # Add any optional dependencies here, installable via `pip install .[extra]`
+[project.optional-dependencies]
 
-[project.scripts] # Add any console scripts here
+[project.scripts]
+MESSY-synth = "MESSY_synth.__main__:main"
 
-[tool.pytest.ini_options] # Default pytest options
+[tool.pytest.ini_options]
 addopts = [
   "--color=yes",
-  "--doctest-modules", # Ensures that doctest runs
+  "--doctest-modules",
   "--ignore=docs",
   "--ignore=AGENTS.md",
   "--ignore=CONTRIBUTORS.md",
   "--doctest-glob=*.md",
   "--doctest-continue-on-failure",
 ]
-markers = [] # Add any custom pytest markers here
+markers = [
+  "slow: end-to-end tests that run a full MEDS-Extract pipeline (deselect with '-m \"not slow\"')",
+]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "ELLIPSIS"]
 
 [project.urls]
-Homepage = "https://github.com/McDermottHealthAI/REPO_NAME" # Replace with your repo URL
-Issues = "https://github.com/McDermottHealthAI/REPO_NAME/issues" # Replace with your repo URL
+Homepage = "https://github.com/mmcdermott/MESSY_synth"
+Issues = "https://github.com/mmcdermott/MESSY_synth/issues"
 
-[tool.ruff] # Ruff configuration for linting and formatting
+[tool.ruff]
 target-version = "py312"
 line-length = 110
 extend-exclude = ["docs/index.md"]
@@ -80,10 +96,12 @@ select = [
 "test_*" = ["DTZ001"]  # Ignore datetimez in test files
 
 [tool.ruff.lint.pep8-naming]
-extend-ignore-names = ["*MEDS*", "*NRT*", "D", "L"] # Allow common abbreviations; "D" is used for distributions/datasets
+# Allow common abbreviations; "D" is used for distributions/datasets. MESSY is the
+# name of the MEDS-Extract config format this package reads, and is always capitalized.
+extend-ignore-names = ["*MEDS*", "*MESSY*", "NRT", "D", "L"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.ruff.lint.isort]
-known-first-party = ["package_name"]  # Replace with your actual package name
+known-first-party = ["MESSY_synth"]

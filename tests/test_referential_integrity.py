@@ -1,0 +1,160 @@
+"""Cross-file invariants that make generated data actually extractable.
+
+Each of these failure modes is silent in MEDS-Extract: a dangling join key nulls ``subject_id`` and
+the row is dropped without an error, and a ``_metadata`` dictionary that misses the event's
+vocabulary just produces null descriptions. They are therefore asserted here directly rather than
+being left to the end-to-end test, which would only report the symptom.
+"""
+
+from __future__ import annotations
+
+import pytest
+from MEDS_extract.config import MessyConfig
+from MEDS_extract.io import resolve_source_files
+
+from MESSY_synth import GenerationOptions, generate, synthesize
+from MESSY_synth.constraints import ValueKind
+
+#: A config exercising every structural feature the generator has to satisfy at once: a join to a
+#: dimension table, an aggregated join, derived `_table.cols`, nested prefixes, a metadata
+#: dictionary with a composite (partially matched) code, static events, and birth/death.
+FEATURE_CONFIG = {
+    "etl": {
+        "dataset_name": "Features",
+        "raw_dataset_version": "1",
+        "split_fracs": {"train": 0.5, "tuning": 0.25, "held_out": 0.25},
+    },
+    "_defaults": {"subject_id": "$pid"},
+    "hosp/patients": {
+        "_table": {
+            "join": {"hosp/admissions": {"key": "pid", "cols": {"deathtime": "min"}}},
+            "cols": {"final_dod": "$deathtime ?? $dod"},
+        },
+        "sex": {"code": 'f"SEX//{$sex}"', "time": None},
+        "dob": {"code": "MEDS_BIRTH", "time": '$dob::"%Y-%m-%d"'},
+        "death": {"code": "MEDS_DEATH", "time": '$final_dod::?"%Y-%m-%d %H:%M:%S"'},
+    },
+    "hosp/admissions": {
+        "admit": {"code": 'f"ADMIT//{$admission_type}"', "time": '$admittime::"%Y-%m-%d %H:%M:%S"'},
+    },
+    "hosp/labs": {
+        "_table": {"join": {"hosp/stays": {"key": "stay_id", "cols": ["pid"]}}},
+        "lab": {
+            "code": 'f"LAB//{$itemid}//{$uom}"',
+            "time": '$charttime::"%Y-%m-%d %H:%M:%S"',
+            "numeric_value": "$valuenum",
+            "_metadata": {"hosp/d_labitems": {"itemid": "$itemid", "description": "$label"}},
+        },
+    },
+}
+
+
+@pytest.fixture
+def features_cfg() -> MessyConfig:
+    """Return the parsed feature-coverage config.
+
+    Returns:
+        The parsed config.
+    """
+    return MessyConfig.parse(FEATURE_CONFIG)
+
+
+def test_every_table_the_config_needs_is_generated(features_cfg):
+    """Event tables, join targets, and metadata dictionaries all get a file."""
+    dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
+    expected = set(features_cfg.needed_source_columns()) | set(features_cfg.events_by_metadata_prefix())
+    assert set(dataset.frames) == expected
+
+
+def test_columns_match_what_meds_extract_will_read(features_cfg):
+    """Each generated frame carries exactly the columns MEDS-Extract plans to project."""
+    dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
+    for prefix, columns in features_cfg.needed_source_columns().items():
+        assert set(dataset.frames[prefix].columns) == set(columns), prefix
+
+
+def test_all_subject_columns_share_one_universe(features_cfg):
+    """Every table's subject ids are drawn from the same pool, so events merge onto one subject."""
+    dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
+    universe = set(range(1, 17))
+    seen = 0
+    for table in dataset.plan.tables:
+        if table.subject_column is None:
+            continue
+        seen += 1
+        values = set(dataset.frames[table.prefix][table.subject_column].drop_nulls().to_list())
+        assert values <= universe, table.prefix
+    assert seen >= 3
+
+
+def test_join_keys_resolve_on_the_far_side(features_cfg):
+    """No join key dangles: MEDS-Extract left joins would silently drop those rows."""
+    dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
+    for table in features_cfg.event_tables:
+        if table.join is None:
+            continue
+        left = dataset.frames[table.input_prefix]
+        right = dataset.frames[table.join.input_prefix]
+        for lkey, rkey in zip(table.join.left_on, table.join.right_on, strict=True):
+            missing = set(left[lkey].drop_nulls().to_list()) - set(right[rkey].drop_nulls().to_list())
+            assert not missing, f"{table.input_prefix}.{lkey} -> {table.join.input_prefix}.{rkey}"
+
+
+def test_metadata_dictionary_covers_the_event_vocabulary(features_cfg):
+    """The dictionary holds every code component the event table can emit."""
+    dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
+    events = set(dataset.frames["hosp/labs"]["itemid"].drop_nulls().to_list())
+    dictionary = set(dataset.frames["hosp/d_labitems"]["itemid"].to_list())
+    assert events <= dictionary
+    assert events
+
+
+def test_birth_precedes_events_and_death_follows_them(features_cfg):
+    """Each subject's timeline is ordered, which downstream MEDS tooling assumes."""
+    dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
+    for timeline in dataset.timelines.values():
+        assert timeline.birth < timeline.window_start < timeline.window_end
+        assert timeline.death is None or timeline.death > timeline.window_end
+
+
+def test_generation_is_deterministic(features_cfg):
+    """The same config and seed reproduce the same data."""
+    a = generate(features_cfg, GenerationOptions(seed=7, n_subjects=16))
+    b = generate(features_cfg, GenerationOptions(seed=7, n_subjects=16))
+    for prefix, frame in a.frames.items():
+        assert frame.equals(b.frames[prefix]), prefix
+
+
+def test_a_different_seed_changes_the_data(features_cfg):
+    """Seeding actually varies the output, so a smoke test can be re-rolled."""
+    a = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
+    b = generate(features_cfg, GenerationOptions(seed=2, n_subjects=16))
+    assert not a.frames["hosp/labs"].equals(b.frames["hosp/labs"])
+
+
+def test_written_files_resolve_through_meds_extracts_own_resolver(features_cfg, tmp_path):
+    """MEDS-Extract can find every table, in exactly one layout, at the paths we wrote."""
+    result = synthesize(features_cfg, tmp_path, n_subjects=16, seed=1)
+    assert result.ok, [str(f) for f in result.findings]
+    for prefix in features_cfg.needed_source_columns():
+        found = resolve_source_files(tmp_path, prefix)
+        assert len(found) == 1, f"{prefix} resolved to {found}"
+
+
+def test_every_event_yields_rows(features_cfg, tmp_path):
+    """The dry run confirms no event silently produces nothing."""
+    result = synthesize(features_cfg, tmp_path, n_subjects=16, seed=1, null_fraction=0.0)
+    assert result.events is not None
+    empty = result.events.filter(result.events["rows_out"] == 0)
+    assert empty.height == 0, empty
+
+
+def test_subject_ids_are_int64_castable(features_cfg):
+    """MEDS-Extract casts subject ids with strict=True, so they must be true integers."""
+    dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
+    for table in dataset.plan.tables:
+        if table.subject_column is None:
+            continue
+        column = next(c for c in table.columns if c.name == table.subject_column)
+        assert column.constraint.kind is ValueKind.SUBJECT_ID
+        assert dataset.frames[table.prefix][table.subject_column].dtype.is_integer()
