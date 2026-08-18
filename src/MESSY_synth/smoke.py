@@ -244,7 +244,24 @@ def smoke_test(
 
     Returns:
         The :class:`SmokeResult`.
+
+    Raises:
+        TypeError: If ``spec`` is an in-memory config rather than something resolvable by path.
+
+    Examples:
+        >>> from MEDS_extract.config import MessyConfig
+        >>> smoke_test(MessyConfig.parse({"t": {"e": {"code": "X", "time": None}}}), "/tmp")
+        Traceback (most recent call last):
+            ...
+        TypeError: smoke_test needs a spec `meds-extract-run` can resolve...
     """
+    if not isinstance(spec, str | Path):
+        raise TypeError(
+            f"smoke_test needs a spec `meds-extract-run` can resolve — a registered name, a pkg:// "
+            f"reference, or a path to a MESSY file — not a {type(spec).__name__}. The ETL runs in a "
+            f"subprocess, so an in-memory config cannot be handed to it; write it to a file first."
+        )
+
     workdir = Path(workdir)
     input_dir = workdir / "raw"
     output_dir = workdir / "meds"

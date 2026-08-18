@@ -28,7 +28,13 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from .constraints import ColumnConstraint, ValueKind
-from .plan import DEFAULT_ROWS_PER_SUBJECT, DEFAULT_VOCAB_SIZE, SUBJECT_POOL, build_plan
+from .plan import (
+    DEFAULT_ROWS_PER_SUBJECT,
+    DEFAULT_VOCAB_SIZE,
+    MAX_METADATA_ROWS,
+    SUBJECT_POOL,
+    build_plan,
+)
 from .values import ValueFactory, build_timeline, categorical_pool, format_datetime
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -240,7 +246,13 @@ def _generate_table(
     if table.is_metadata:
         return _generate_metadata_table(table, pools, options)
 
-    n_rows = table.n_rows
+    # The plan sizes tables from each pool's *requested* size, but a materialized pool can end up
+    # longer — required values, coalesce fallbacks and regex-derived members are all added on top.
+    # A covering column must enumerate whatever the pool actually holds, so the row count is raised
+    # to match; otherwise the tail of the pool never appears and every row referencing it dangles.
+    n_rows = max(
+        [table.n_rows, *(len(pools[c.pool_id]) for c in table.columns if c.covers_pool and c.pool_id)]
+    )
     # Round-robin rather than random assignment, so every subject is represented in every table
     # instead of a few subjects hogging the rows by chance.
     row_subjects = [subject_ids[i % len(subject_ids)] for i in range(n_rows)] if subject_ids else []
@@ -275,7 +287,10 @@ def _generate_metadata_table(
     other_columns = [c for c in table.columns if c not in key_columns]
 
     if key_columns:
-        combos = list(itertools.product(*[pools[c.pool_id] for c in key_columns]))[: table.n_rows]
+        # Every combination, not `table.n_rows` of them: the plan's estimate is based on requested
+        # pool sizes, and truncating to it would leave part of the event vocabulary without a
+        # dictionary entry — which shows up only as silently null descriptions in codes.parquet.
+        combos = list(itertools.product(*[pools[c.pool_id] for c in key_columns]))[:MAX_METADATA_ROWS]
     else:
         combos = [()] * table.n_rows
 

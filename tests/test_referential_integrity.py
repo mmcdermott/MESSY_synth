@@ -158,3 +158,38 @@ def test_subject_ids_are_int64_castable(features_cfg):
         column = next(c for c in table.columns if c.name == table.subject_column)
         assert column.constraint.kind is ValueKind.SUBJECT_ID
         assert dataset.frames[table.prefix][table.subject_column].dtype.is_integer()
+
+
+#: A config whose `kind` column is compared against more literals than `vocab_size` allows, so the
+#: materialized pool ends up longer than the size the plan asked for.
+OVERSIZED_POOL_CONFIG = {
+    "etl": {"dataset_name": "Oversized", "raw_dataset_version": "1"},
+    "labs": {
+        "_defaults": {"subject_id": "$pid"},
+        "lab": {
+            "code": 'f"LAB//{$kind}"',
+            "time": '$ts::"%Y-%m-%d"',
+            "_metadata": {"d_kinds": {"kind": "$kind", "description": "$label"}},
+        },
+        "other": {
+            "code": " else ".join(f'"C{i}" if $kind == "K{i}"' for i in range(6)) + ' else "OTHER"',
+            "time": '$ts::"%Y-%m-%d"',
+        },
+    },
+}
+
+
+def test_pool_coverage_survives_a_pool_longer_than_its_planned_size():
+    """A dictionary covers the whole vocabulary even when the pool outgrows the requested size.
+
+    Pools are sized during planning, but the materialized pool can be longer: compared-against
+    literals, coalesce fallbacks and regex-derived members are all added on top of the requested
+    ``vocab_size``. Sizing the dictionary from the planned number would truncate it, and the codes
+    built from the missing values would come back with null descriptions and no error anywhere.
+    """
+    cfg = MessyConfig.parse(OVERSIZED_POOL_CONFIG)
+    dataset = generate(cfg, GenerationOptions(seed=0, n_subjects=16, vocab_size=3))
+    events = set(dataset.frames["labs"]["kind"].drop_nulls().to_list())
+    dictionary = set(dataset.frames["d_kinds"]["kind"].to_list())
+    assert len(events) > 3, "the pool should have outgrown vocab_size for this test to mean anything"
+    assert events <= dictionary, events - dictionary
