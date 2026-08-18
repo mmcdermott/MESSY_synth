@@ -290,7 +290,16 @@ def _generate_metadata_table(
         # Every combination, not `table.n_rows` of them: the plan's estimate is based on requested
         # pool sizes, and truncating to it would leave part of the event vocabulary without a
         # dictionary entry — which shows up only as silently null descriptions in codes.parquet.
-        combos = list(itertools.product(*[pools[c.pool_id] for c in key_columns]))[:MAX_METADATA_ROWS]
+        combos = list(itertools.product(*[pools[c.pool_id] for c in key_columns]))
+        if len(combos) > MAX_METADATA_ROWS:
+            # Say so rather than truncating quietly: the dropped combinations become codes with no
+            # description, which is indistinguishable from a broken metadata join unless flagged.
+            logger.warning(
+                f"{table.prefix}: {len(combos)} key combinations exceeds the {MAX_METADATA_ROWS}-row "
+                f"cap; dropping {len(combos) - MAX_METADATA_ROWS}. Codes built from the dropped "
+                f"combinations will have no description. Lower --vocab-size to fit."
+            )
+            combos = combos[:MAX_METADATA_ROWS]
     else:
         combos = [()] * table.n_rows
 
