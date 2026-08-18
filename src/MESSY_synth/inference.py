@@ -689,7 +689,11 @@ def _visit_generic(
         child_expect = ValueKind.UNKNOWN
     elif key in ("and", "or", "not"):
         child_expect = ValueKind.BOOLEAN
-    elif key in ("add", "subtract") and (range_hint or expect is ValueKind.DATETIME_STR):
+    elif (
+        key in ("add", "subtract")
+        and (range_hint or expect is ValueKind.DATETIME_STR)
+        and not _is_string_concat(children)
+    ):
         # Integer arithmetic whose result is read as a date: the only coherent reading is a year on
         # the left and an offset (an age, in every real config that does this) on the right. Both
         # MIMIC-IV's `($anchor_year - $anchor_age)::str ... ::year` and NWICU's `... ::?"%Y"` land
@@ -714,6 +718,39 @@ def _visit_generic(
 
     for child in children:
         _visit(child, child_expect, ctx, cs, note, seen)
+
+
+def _is_string_concat(children: list[NodeBase]) -> bool:
+    """Return whether a ``+`` is joining strings rather than doing arithmetic.
+
+    dftly spells string concatenation with the same ``+`` as addition, so a date assembled as
+    ``$year + "-" + $month`` reaches the same node as ``$anchor_year - $anchor_age``. A string
+    literal operand is the giveaway: nothing numeric adds ``"-"`` to anything. Without this guard
+    the year heuristic would type each fragment as a calendar year and generate numbers where the
+    config expects text.
+
+    The scan recurses through nested ``+`` nodes: ``$a + "-" + $b`` parses as
+    ``Add(Add($a, "-"), $b)``, so the outer node's own operands contain no string literal at all.
+
+    Args:
+        children: The operands.
+
+    Returns:
+        True if any operand, at any depth of the arithmetic chain, is a string literal.
+
+    Examples:
+        >>> from dftly import Parser
+        >>> _is_string_concat(_children(Parser()('$a + "-" + $b')))
+        True
+        >>> _is_string_concat(_children(Parser()("$anchor_year - $anchor_age")))
+        False
+    """
+    for child in children:
+        if isinstance(_literal_value(child), str):
+            return True
+        if getattr(child, "KEY", "") in ("add", "subtract") and _is_string_concat(_children(child)):
+            return True
+    return False
 
 
 def _seed_comparison(
