@@ -27,11 +27,16 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
+from MEDS_extract.config import MessyConfig
 
 from .synth import synthesize
-from .validate import Finding
+from .validate import Finding, split_fracs
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -151,11 +156,17 @@ def run_etl(
     )
 
 
-def check_output(output_dir: str | Path) -> tuple[list[Finding], dict[str, int]]:
+def check_output(
+    output_dir: str | Path,
+    expected_splits: Iterable[str] = (),
+) -> tuple[list[Finding], dict[str, int]]:
     """Inspect a MEDS output directory and report whether it is genuinely populated.
 
     Args:
         output_dir: The ETL's output directory.
+        expected_splits: Split names the config asked for. A split that rounded down to zero
+            subjects does not appear in the output at all, so it can only be detected by comparing
+            against the expected set — counting rows per present split would never find it.
 
     Returns:
         The findings and a stats mapping with ``n_events``, ``n_subjects``, ``n_codes``, and
@@ -163,7 +174,7 @@ def check_output(output_dir: str | Path) -> tuple[list[Finding], dict[str, int]]
 
     Examples:
         >>> with tempfile.TemporaryDirectory() as d:
-        ...     findings, stats = check_output(d)
+        ...     findings, stats = check_output(d, expected_splits=["train"])
         ...     print(findings[0])
         ...     stats["n_events"]
         ERROR    output: no data/ directory: the ETL produced no MEDS cohort at all.
@@ -196,11 +207,17 @@ def check_output(output_dir: str | Path) -> tuple[list[Finding], dict[str, int]]
     else:
         splits = pl.read_parquet(splits_fp)
         stats["n_subjects"] = splits["subject_id"].n_unique()
-        empty = [
-            row["split"] for row in splits.group_by("split").len().iter_rows(named=True) if row["len"] == 0
-        ]
-        if empty:
-            findings.append(Finding("error", "metadata/", f"empty split(s): {empty}."))
+        present = set(splits["split"].unique().to_list())
+        missing = sorted(set(expected_splits) - present)
+        if missing:
+            findings.append(
+                Finding(
+                    "error",
+                    "metadata/",
+                    f"split(s) {missing} got no subjects. Raise n_subjects: the rarest split "
+                    f"rounded down to zero.",
+                )
+            )
 
     codes_fp = output_dir / "metadata" / "codes.parquet"
     if not codes_fp.is_file():
@@ -266,8 +283,26 @@ def smoke_test(
     input_dir = workdir / "raw"
     output_dir = workdir / "meds"
 
+    try:
+        cfg = MessyConfig.load(spec)
+        # `event_tables` is a cached_property: `load` only reads the YAML, and the per-table
+        # validation that rejects e.g. a self-join does not run until the tables are materialized.
+        # Force it here so a config MEDS-Extract refuses is caught as a finding rather than
+        # escaping as a traceback from somewhere inside generation.
+        _ = cfg.event_tables
+    except Exception as e:
+        # A config MEDS-Extract itself rejects is a result, not a crash: surfacing broken configs
+        # is precisely what a smoke test across a fleet of ETLs exists to do, and it should read as
+        # one failing row rather than a traceback.
+        return SmokeResult(
+            spec=str(spec),
+            input_dir=input_dir,
+            output_dir=output_dir,
+            findings=[Finding("error", "config", f"could not be loaded: {type(e).__name__}: {e}")],
+        )
+
     synth = synthesize(
-        spec,
+        cfg,
         input_dir,
         n_subjects=n_subjects,
         rows_per_subject=rows_per_subject,
@@ -290,7 +325,7 @@ def smoke_test(
     if proc.returncode != 0:
         findings.append(Finding("error", "etl", f"meds-extract-run exited {proc.returncode}."))
 
-    out_findings, stats = check_output(output_dir)
+    out_findings, stats = check_output(output_dir, expected_splits=split_fracs(cfg))
     findings.extend(out_findings)
 
     order = {"error": 0, "warning": 1, "info": 2}

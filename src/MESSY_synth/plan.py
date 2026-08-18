@@ -38,6 +38,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: Pool identity for the one subject universe shared by every table in the dataset.
 SUBJECT_POOL = "__subjects__"
 
+#: Pool identity for the columns a config hashes to derive its subject ids. Distinct from
+#: :data:`SUBJECT_POOL` because these hold arbitrary text, not integers, but sized identically:
+#: one value per subject.
+SUBJECT_KEY_POOL = "__subject_keys__"
+
 #: Default number of rows generated per subject in an event table.
 DEFAULT_ROWS_PER_SUBJECT = 4
 
@@ -281,6 +286,7 @@ def build_plan(
 
     uf = UnionFind()
     _link_subjects(constraints, source_columns, metadata, uf)
+    _link_subject_keys(constraints, source_columns, uf)
     _link_joins(cfg, uf)
     _link_metadata(metadata, uf)
     _link_identifiers_by_name(cfg, source_columns, uf)
@@ -433,6 +439,28 @@ def _link_subjects(
                 uf.union((SUBJECT_POOL, SUBJECT_POOL), (prefix, column))
 
 
+def _link_subject_keys(
+    constraints: ConstraintSet,
+    source_columns: dict[str, list[str]],
+    uf: UnionFind,
+) -> None:
+    """Union every column that a config hashes into a subject id.
+
+    ``_defaults: {subject_id: "hash($MRN)"}`` makes ``MRN`` a stand-in for the subject. Every table
+    hashing it must draw from the same values, or the two tables describe disjoint people, and the
+    pool must hold one value per requested subject rather than a generic vocabulary.
+
+    Args:
+        constraints: The inferred constraints.
+        source_columns: MEDS-Extract's per-prefix column plan.
+        uf: The union-find to write into.
+    """
+    for prefix, columns in source_columns.items():
+        for column in columns:
+            if constraints.get(prefix, column).subject_key:
+                uf.union((SUBJECT_KEY_POOL, SUBJECT_KEY_POOL), (prefix, column))
+
+
 def _link_joins(cfg: MessyConfig, uf: UnionFind) -> None:
     """Union each join's left key with its right key.
 
@@ -547,11 +575,14 @@ def _build_pools(
         for prefix, column in group:
             merged = merged.merge(constraints.get(prefix, column))
         is_subject = root == (SUBJECT_POOL, SUBJECT_POOL) or merged.kind is ValueKind.SUBJECT_ID
+        is_subject_key = merged.subject_key
         shared = len(group) > 1 or merged.kind in (ValueKind.CATEGORICAL, ValueKind.IDENTIFIER)
         if not (is_subject or shared):
             continue
         if is_subject:
             pool_id, size, kind = SUBJECT_POOL, n_subjects, ValueKind.SUBJECT_ID
+        elif is_subject_key:
+            pool_id, size, kind = SUBJECT_KEY_POOL, n_subjects, ValueKind.IDENTIFIER
         else:
             pool_id = "|".join(f"{p}.{c}" for p, c in sorted(group))
             kind = merged.kind if merged.kind is not ValueKind.UNKNOWN else ValueKind.CATEGORICAL
@@ -580,6 +611,8 @@ def _pool_for(key: tuple[str, str], uf: UnionFind, pools: dict[str, ValuePool]) 
     root = uf.find(key)
     if root == (SUBJECT_POOL, SUBJECT_POOL):
         return SUBJECT_POOL
+    if root == (SUBJECT_KEY_POOL, SUBJECT_KEY_POOL):
+        return SUBJECT_KEY_POOL
     for pool_id, pool in pools.items():
         if key in pool.members:
             return pool_id

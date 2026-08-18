@@ -98,6 +98,10 @@ class ColumnConstraint:
             needs at least 3 characters) and from ``len_chars($col) > n`` comparisons.
         nullable: Whether the column may contain nulls. Set False for columns whose nullity would
             break the run outright — subject ids and join keys.
+        subject_key: True when this column is the *input* to a ``hash()``/``signed_hash()`` that
+            produces the subject id. Such a column is not itself a subject id — it can be any text
+            — but it stands in one-to-one for a subject, so its pool must be sized by the requested
+            subject count and shared across every table that hashes it.
         temporal_role: ``"birth"`` or ``"death"`` when this column supplies the timestamp of a
             ``MEDS_BIRTH`` / ``MEDS_DEATH`` event. MEDS treats those two as the bounds of a
             subject's timeline, and many downstream tools assume birth precedes every other event,
@@ -154,6 +158,7 @@ class ColumnConstraint:
     min_chars: int = 0
     nullable: bool = True
     strict_parse: bool = False
+    subject_key: bool = False
     temporal_role: str | None = None
     notes: tuple[str, ...] = ()
 
@@ -192,6 +197,7 @@ class ColumnConstraint:
             min_chars=max(self.min_chars, other.min_chars),
             nullable=self.nullable and other.nullable,
             strict_parse=self.strict_parse or other.strict_parse,
+            subject_key=self.subject_key or other.subject_key,
             temporal_role=self.temporal_role or other.temporal_role,
             notes=_ordered_union(self.notes, other.notes),
         )

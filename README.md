@@ -32,8 +32,19 @@ That gets you two things:
 
 ## Install
 
+Not yet published to PyPI — install from source:
+
 ```bash
-uv add MESSY_synth
+uv add git+https://github.com/mmcdermott/MESSY_synth
+```
+
+Or for development:
+
+```bash
+git clone https://github.com/mmcdermott/MESSY_synth
+cd MESSY_synth
+uv sync --group dev
+uv run pre-commit install
 ```
 
 ## Quick start

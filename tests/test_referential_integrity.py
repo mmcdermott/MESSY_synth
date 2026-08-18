@@ -193,3 +193,62 @@ def test_pool_coverage_survives_a_pool_longer_than_its_planned_size():
     dictionary = set(dataset.frames["d_kinds"]["kind"].to_list())
     assert len(events) > 3, "the pool should have outgrown vocab_size for this test to mean anything"
     assert events <= dictionary, events - dictionary
+
+
+#: A config deriving subject ids by hashing a text column, rather than reading an integer one.
+HASHED_SUBJECT_CONFIG = {
+    "etl": {"dataset_name": "Hashed", "raw_dataset_version": "1"},
+    "_defaults": {"subject_id": "hash($MRN)"},
+    "patients": {"sex": {"code": 'f"SEX//{$sex}"', "time": None}},
+    "labs": {"lab": {"code": 'f"LAB//{$itemid}"', "time": '$ts::"%Y-%m-%d"'}},
+}
+
+
+def test_hashed_subject_keys_are_shared_and_sized_by_subject_count():
+    """A column hashed into the subject id gets one value per requested subject, shared by table.
+
+    ``hash($MRN)`` makes ``MRN`` stand in one-to-one for a subject. Treating it as an ordinary
+    categorical would size it by ``vocab_size`` — so the dataset would quietly contain
+    ``vocab_size`` subjects instead of the requested number — and would give each table its own
+    vocabulary, describing two disjoint sets of people.
+    """
+    cfg = MessyConfig.parse(HASHED_SUBJECT_CONFIG)
+    dataset = generate(cfg, GenerationOptions(seed=0, n_subjects=25))
+    patients = set(dataset.frames["patients"]["MRN"].drop_nulls().to_list())
+    labs = set(dataset.frames["labs"]["MRN"].drop_nulls().to_list())
+    assert len(patients) == 25
+    assert patients == labs
+
+
+def test_a_config_meds_extract_rejects_is_reported_not_raised(tmp_path):
+    """A config that cannot be loaded produces a finding, not a traceback.
+
+    Surfacing broken ETL configs is the point of a smoke test across a fleet of them, so an
+    unloadable config has to read as one failing result. MEDS-Extract validates tables lazily, via a
+    ``cached_property``, so the rejection does not happen until the tables are materialized — which
+    is why it is easy to let it escape from somewhere deep in generation instead.
+    """
+    import yaml
+
+    from MESSY_synth.smoke import smoke_test
+
+    # A self-join: every joined column already exists on the left side, which 0.7 rejects outright.
+    cfg_fp = tmp_path / "messy.yaml"
+    cfg_fp.write_text(
+        yaml.safe_dump(
+            {
+                "etl": {"dataset_name": "Broken", "raw_dataset_version": "1"},
+                "ops": {
+                    "_defaults": {"subject_id": "$pid"},
+                    "_table": {"join": {"ops": {"key": "pid", "cols": {"age": "min"}}}},
+                    "e": {"code": "X", "time": None},
+                },
+            }
+        )
+    )
+    result = smoke_test(cfg_fp, tmp_path / "run")
+    assert not result.ok
+    assert result.returncode is None, "the ETL should never have been started"
+    assert any("could not be loaded" in f.message and "ops" in f.message for f in result.findings), (
+        result.findings
+    )

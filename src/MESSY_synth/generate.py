@@ -32,6 +32,7 @@ from .plan import (
     DEFAULT_ROWS_PER_SUBJECT,
     DEFAULT_VOCAB_SIZE,
     MAX_METADATA_ROWS,
+    SUBJECT_KEY_POOL,
     SUBJECT_POOL,
     build_plan,
 )
@@ -351,6 +352,14 @@ def _generate_column(
 
     if column.pool_id == SUBJECT_POOL:
         return list(row_subjects)
+
+    if column.pool_id == SUBJECT_KEY_POOL:
+        # This column is hashed into the subject id, so it is a function *of the subject*, not a
+        # free draw. Indexing by the row's subject keeps one key per subject (sampling would give
+        # some subjects two keys and others none) and keeps the key consistent with the timeline
+        # already chosen for that subject.
+        pool = pools[column.pool_id]
+        return [pool[(subject - 1) % len(pool)] for subject in row_subjects]
 
     if column.pool_id is not None:
         pool = pools[column.pool_id]

@@ -497,9 +497,22 @@ def _visit(
 
         case Hash() | SignedHash():
             # A hash accepts anything and yields the subject id itself, so the source column is a
-            # free-form identifier rather than something that must cast to Int64.
+            # free-form identifier rather than something that must cast to Int64. When the hash is
+            # what produces the subject id, though, the column stands in one-to-one for a subject
+            # and has to be sized and shared accordingly.
+            is_subject = expect is ValueKind.SUBJECT_ID
             for child in _children(node):
                 _visit(child, ValueKind.IDENTIFIER, ctx, cs, f"{note}: hashed", seen)
+                if is_subject:
+                    _decorate(
+                        child,
+                        ctx,
+                        cs,
+                        ColumnConstraint(subject_key=True, nullable=False).with_note(
+                            f"{note}: hashed into the subject id"
+                        ),
+                        seen,
+                    )
 
         case SetTime():
             if node.args:

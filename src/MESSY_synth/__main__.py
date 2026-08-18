@@ -128,18 +128,24 @@ def main(argv: list[str] | None = None) -> int:
         format="%(message)s",
     )
 
-    result = synthesize(
-        args.spec,
-        args.output_dir,
-        n_subjects=args.n_subjects,
-        rows_per_subject=args.rows_per_subject,
-        vocab_size=args.vocab_size,
-        seed=args.seed,
-        null_fraction=args.null_fraction,
-        fmt=args.format,
-        numeric_ranges=dict(args.numeric_range),
-        validate=not args.no_validate,
-    )
+    try:
+        result = synthesize(
+            args.spec,
+            args.output_dir,
+            n_subjects=args.n_subjects,
+            rows_per_subject=args.rows_per_subject,
+            vocab_size=args.vocab_size,
+            seed=args.seed,
+            null_fraction=args.null_fraction,
+            fmt=args.format,
+            numeric_ranges=dict(args.numeric_range),
+            validate=not args.no_validate,
+        )
+    except Exception as e:
+        # A config MEDS-Extract itself rejects is the answer, not a crash — reporting it as one
+        # failing line is what makes this usable as a CI gate.
+        print(f"ERROR    config: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
     if not args.quiet:
         print(f"\nWrote {len(result.files)} file(s) to {result.output_dir} as {result.fmt}:")
@@ -187,6 +193,10 @@ def explain(result) -> str:
             if not c.effective_nullable:
                 extras.append("not-null")
             lines.append(f"      {column.name:<32} {c.kind.name:<13} {' '.join(extras)}")
+            # The notes are the actual derivation — which expression, in which event, imposed each
+            # constraint. Without them "why is this column a string?" has no answer.
+            for note in c.notes:
+                lines.append(f"          <- {note}")
     return "\n".join(lines)
 
 

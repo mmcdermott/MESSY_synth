@@ -11,9 +11,14 @@ That styling is also load-bearing for correctness, not just for honesty. MEDS-Ex
 when it reads CSV sources, but reads ``_metadata`` dictionary files with ``infer_schema=False`` so
 their keys keep their exact text. A numeric-looking key like ``01.90`` would be inferred as the
 float ``1.9`` on the event side while staying the string ``"01.90"`` on the dictionary side, and
-the metadata join would silently match nothing. Because every categorical pool is guaranteed to
-contain at least one alphabetic ``SYNTH_`` token (see :func:`categorical_pool`), polars always
-infers such a column as a string and the two sides keep agreeing.
+the metadata join would silently match nothing.
+
+Ordinary categorical pools avoid that by always containing an alphabetic ``SYNTH_`` token, which
+forces polars to infer the column as a string. A *regex-constrained* pool cannot make that promise
+— ``extract /2003|2010/ from $admissionyeargroup`` admits only digits — so the guarantee there is
+enforced downstream instead: :func:`MESSY_synth.writer.csv_would_retype` round-trips each frame
+through CSV and switches the whole dataset to parquet if any dtype would change. That is why
+AmsterdamUMCdb is written as parquet.
 """
 
 from __future__ import annotations
