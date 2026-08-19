@@ -303,9 +303,26 @@ def _materialize_pools(plan: DatasetPlan, options: GenerationOptions) -> dict[st
             continue
         # Name the pool after its first member column so tokens are self-describing.
         column = pool.members[0][1] if pool.members else pool_id
-        pools[pool_id] = categorical_pool(
-            column, pool.constraint, pool.size, random.Random(f"{options.seed}:pool:{pool_id}")
-        )
+        rng = random.Random(f"{options.seed}:pool:{pool_id}")
+        if pool.kind in (ValueKind.NUMERIC, ValueKind.INTEGER):
+            required = list(
+                dict.fromkeys(
+                    value
+                    for literal in pool.constraint.required_values
+                    if (value := _as_number(literal, pool.kind is ValueKind.INTEGER)) is not None
+                )
+            )
+            factory = ValueFactory(rng, numeric_ranges=options.numeric_ranges)
+            pools[pool_id] = required + [
+                factory.numeric(
+                    column,
+                    integral=pool.kind is ValueKind.INTEGER,
+                    inferred_range=pool.constraint.numeric_range,
+                )
+                for _ in range(max(1, pool.size - len(required)))
+            ]
+        else:
+            pools[pool_id] = categorical_pool(column, pool.constraint, pool.size, rng)
     return pools
 
 
@@ -397,7 +414,7 @@ def _generate_metadata_table(
 
     data: dict[str, list] = {}
     for i, column in enumerate(key_columns):
-        data[column.name] = [combo[i] for combo in combos]
+        data[column.name] = [str(combo[i]) for combo in combos]
     for column in other_columns:
         factory = ValueFactory(
             random.Random(f"{options.seed}:{table.prefix}:{column.name}"),

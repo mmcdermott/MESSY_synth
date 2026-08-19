@@ -220,6 +220,34 @@ def test_hashed_subject_keys_are_shared_and_sized_by_subject_count():
     assert patients == labs
 
 
+def test_numeric_metadata_key_stays_numeric_in_its_event_table(tmp_path):
+    """Metadata writes keys as text without corrupting numeric event-side keys."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "NumericMetadata", "raw_dataset_version": "1"},
+            "data_ref": {
+                "_defaults": {"subject_id": "$pid"},
+                "baseline": {
+                    "code": 'f"CASE_ATTR//{$FieldID}" if $FieldID == 3097',
+                    "time": '$time::"%Y-%m-%d"',
+                    "_metadata": {
+                        "d_references": {
+                            "FieldID": "$ReferenceGlobalID",
+                            "description": "$ReferenceValue",
+                        }
+                    },
+                },
+            },
+        }
+    )
+
+    result = synthesize(cfg, tmp_path, n_subjects=40, null_fraction=0.0)
+
+    assert result.ok, [str(finding) for finding in result.findings]
+    assert result.fmt == "csv"
+    assert result.dataset.frames["data_ref"]["FieldID"].dtype.is_integer()
+
+
 def test_a_config_meds_extract_rejects_is_reported_not_raised(tmp_path):
     """A config that cannot be loaded produces a finding, not a traceback.
 
