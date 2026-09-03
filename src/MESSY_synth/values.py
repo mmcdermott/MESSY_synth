@@ -50,6 +50,9 @@ EVENT_START = datetime(2010, 1, 1)  # noqa: DTZ001
 #: Length, in days, of each subject's personal event window.
 SUBJECT_WINDOW_DAYS = 1095
 
+# ponytail: only %.f is mapped; extend this map if another ETL needs directives such as %3f.
+_CHRONO_TO_PY = {"%.f": ".%f"}
+
 
 @dataclass(frozen=True)
 class SubjectTimeline:
@@ -409,6 +412,10 @@ def format_datetime(value: datetime, constraint: ColumnConstraint, row_index: in
         '2015-06-01 13:45:00'
         >>> format_datetime(dt, c, 1)
         '2015-06-01'
+        >>> fractional = datetime(2015, 6, 1, 13, 45, 0, 123456)  # noqa: DTZ001
+        >>> c = ColumnConstraint(datetime_formats=("%Y-%m-%d %H:%M:%S%.f",))
+        >>> format_datetime(fractional, c, 0)
+        '2015-06-01 13:45:00.123456'
 
         With no recorded format, ISO-8601 is the fallback:
 
@@ -418,4 +425,7 @@ def format_datetime(value: datetime, constraint: ColumnConstraint, row_index: in
     formats = constraint.datetime_formats
     if not formats:
         return value.isoformat()
-    return value.strftime(formats[row_index % len(formats)])
+    fmt = formats[row_index % len(formats)]
+    for chrono, python in _CHRONO_TO_PY.items():
+        fmt = fmt.replace(chrono, python)
+    return value.strftime(fmt)
