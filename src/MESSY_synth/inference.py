@@ -160,25 +160,6 @@ def infer_constraints(cfg: MessyConfig) -> ConstraintSet:
         >>> cs.get("labs", "test_name").kind.name, cs.get("labs", "result").kind.name
         ('CATEGORICAL', 'NUMERIC')
 
-        Formats on an f-string timestamp propagate to its component columns:
-
-        >>> cfg = MessyConfig.parse({
-        ...     "visits": {
-        ...         "_defaults": {"subject_id": "$patient_id"},
-        ...         "visit": {
-        ...             "code": "VISIT",
-        ...             "time": 'f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"',
-        ...         },
-        ...     },
-        ... })
-        >>> cs = infer_constraints(cfg)
-        >>> date = cs.get("visits", "date")
-        >>> clock = cs.get("visits", "clock")
-        >>> date.kind.name, date.datetime_formats
-        ('DATETIME_STR', ('%Y-%m-%d',))
-        >>> clock.kind.name, clock.datetime_formats
-        ('DATETIME_STR', ('%H:%M:%S',))
-
         Columns pulled through a join are attributed to the table they actually live in:
 
         >>> cfg = MessyConfig.parse({
@@ -455,7 +436,6 @@ def _visit(
                     ).with_note(f"{note}: strptime({fmt!r})"),
                     seen,
                 )
-                _visit_concat_datetime(source, fmt, ctx, cs, note, seen)
 
         case Cast():
             _visit_cast(node, expect, ctx, cs, note, seen, range_hint)
@@ -573,44 +553,6 @@ def _visit(
 
         case _:
             _visit_generic(node, expect, ctx, cs, note, seen, range_hint)
-
-
-def _visit_concat_datetime(
-    source: NodeBase,
-    fmt: object,
-    ctx: _Context,
-    cs: ConstraintSet,
-    note: str,
-    seen: frozenset[str],
-) -> None:
-    """Decorate the two columns joined by an f-string timestamp with their formats."""
-    if not isinstance(source, StringInterpolate) or not isinstance(fmt, str):
-        return
-    template = _literal_value(source.args[0])
-    if not isinstance(template, str):
-        return
-    pieces = source.args[1:]
-    fragments = template.split("{}")
-    # ponytail: 2-piece/1-separator only; more pieces need a general format split.
-    if len(pieces) != 2 or len(fragments) != 3:
-        return
-    sep = fragments[1]
-    idx = fmt.find(sep)
-    if idx <= 0 or idx + len(sep) >= len(fmt):
-        return
-    left, right = fmt[:idx], fmt[idx + len(sep) :]
-    if "%" not in left or "%" not in right:
-        return
-    for piece, piece_fmt in zip(pieces, (left, right), strict=True):
-        _decorate(
-            piece,
-            ctx,
-            cs,
-            ColumnConstraint(kind=ValueKind.DATETIME_STR, datetime_formats=(piece_fmt,)).with_note(
-                f"{note}: f-string timestamp piece {piece_fmt!r}"
-            ),
-            seen,
-        )
 
 
 def _visit_column(
@@ -911,7 +853,7 @@ def _decorate(
             for branch in ("then", "otherwise"):
                 if (b := node.kwargs.get(branch)) is not None:
                     _decorate(b, ctx, cs, constraint, seen)
-        case Strptime() | Cast() | SetTime() | Substring():
+        case Strptime() | Cast() | SetTime():
             # Single-source wrappers are transparent for the purpose of column-level evidence: a
             # `MEDS_DEATH` timestamp is still that column's role whether or not it is parsed on the
             # way in. `SetTime` keeps its source in args rather than kwargs.

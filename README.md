@@ -169,6 +169,49 @@ Some of what it deduces is less obvious than a dtype:
 
 `--explain` prints all of it, per column, with the reasoning attached.
 
+## Explicit column generators
+
+A parse format constrains the expression being parsed, not necessarily its source columns.
+For example, `f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"` does not declare the full
+format of `date`. Register that knowledge explicitly rather than relying on a guessed split:
+
+```python
+>>> from MESSY_synth import chrono_formatter
+>>> split_cfg = MessyConfig.parse({
+...     "etl": {"dataset_name": "SplitTime", "raw_dataset_version": "1"},
+...     "visits": {
+...         "_defaults": {"subject_id": "$pid"},
+...         "visit": {"code": "VISIT", "time": 'f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"'},
+...     },
+... })
+>>> generators = {
+...     ("visits", "date"): chrono_formatter("%Y-%m-%d"),
+...     ("visits", "clock"): chrono_formatter("%H:%M:%S"),
+... }
+>>> with tempfile.TemporaryDirectory() as d:
+...     result = synthesize(split_cfg, d, column_generators=generators)
+...     result.ok
+True
+
+```
+
+- Keys name raw `(table_prefix, column)` pairs, including full nested prefixes, not derived names.
+- Each callable receives a naive synthetic `datetime` and returns one value. Registered ordinary
+    columns in a table share an instant per row, so date/time fragments agree; direct birth/death
+    roles retain the existing timeline handling. Callables must be deterministic for reproducibility.
+- `chrono_formatter` uses Polars' Chrono formatting, the same format language as the ETL parser,
+    including `%.f`, `%.3f`, `%.6f`, `%.9f`, and escaped `%%`. No Python directive translation is needed.
+- Unknown columns, non-callables, metadata columns, and protected shared/subject/join keys are
+    rejected rather than silently breaking relationships. Overrides do not change inferred constraints.
+- Default validation evaluates the generated files through MESSY, including value expressions.
+    Errors and events with no surviving rows fail validation. This is a check of the generated sample,
+    **not proof of every possible callback output or complete branch coverage**. Lenient casts can still
+    produce nulls in some rows. `generate()` alone and `synthesize(validate=False)` do not run this check.
+
+Use the same `column_generators` argument with `smoke_test()` for a full ETL run. Registration is
+currently a **Python API**, not a CLI option; configs requiring it must use a Python wrapper in CI.
+An override may also return a number or custom string, but this is not a general row-context/RNG API.
+
 ## Smoke-testing an ETL
 
 `smoke_test` generates, runs `meds-extract-run`, and then checks the *artifacts* — not just the

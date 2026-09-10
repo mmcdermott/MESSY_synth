@@ -38,6 +38,8 @@ from .validate import Finding, split_fracs
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Iterable
 
+    from .generate import ColumnGenerator
+
 logger = logging.getLogger(__name__)
 
 #: Default wall-clock limit for one ETL invocation.
@@ -245,6 +247,7 @@ def smoke_test(
     seed: int = 0,
     fmt: str = "auto",
     numeric_ranges: dict[str, tuple[float, float]] | None = None,
+    column_generators: dict[tuple[str, str], ColumnGenerator] | None = None,
     timeout: int = DEFAULT_TIMEOUT_S,
 ) -> SmokeResult:
     """Generate synthetic sources for a MESSY config, run its ETL, and check the result.
@@ -257,6 +260,7 @@ def smoke_test(
         seed: Master seed.
         fmt: Source file format; see :data:`~MESSY_synth.writer.FORMATS`.
         numeric_ranges: Per-column numeric range overrides.
+        column_generators: Explicit source-column generators; see :func:`synthesize`.
         timeout: Wall-clock limit for the ETL, in seconds.
 
     Returns:
@@ -309,6 +313,7 @@ def smoke_test(
         seed=seed,
         fmt=fmt,
         numeric_ranges=numeric_ranges,
+        column_generators=column_generators,
     )
     findings = list(synth.findings)
 

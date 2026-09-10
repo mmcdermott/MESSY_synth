@@ -22,7 +22,9 @@ from __future__ import annotations
 import itertools
 import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -49,6 +51,9 @@ logger = logging.getLogger(__name__)
 #: Share of rows in a numeric column that take one of the config's compared-against literals.
 REQUIRED_VALUE_SHARE = 0.35
 
+#: User-supplied rendering for a source column, given a coherent synthetic timestamp.
+ColumnGenerator = Callable[[datetime], object]
+
 
 @dataclass(frozen=True)
 class GenerationOptions:
@@ -64,6 +69,11 @@ class GenerationOptions:
             coalescing and null-drop paths are actually exercised.
         death_probability: Fraction of subjects given a death timestamp.
         numeric_ranges: Per-column-name numeric bounds overriding the default ``(1, 100)``.
+        column_generators: Explicit renderers keyed by raw ``(prefix, column)`` pairs. Each receives
+            a synthetic timestamp; registered ordinary columns share one instant per row and direct
+            birth/death roles use their timeline bounds. Callables must be deterministic to preserve
+            reproducibility. Metadata and protected shared/subject/join keys cannot be overridden.
+            This does not alter inferred constraints; use ``synthesize`` for MESSY validation.
     """
 
     seed: int = 0
@@ -73,6 +83,7 @@ class GenerationOptions:
     null_fraction: float = 0.05
     death_probability: float = 0.3
     numeric_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
+    column_generators: dict[tuple[str, str], ColumnGenerator] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -191,6 +202,7 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
         rows_per_subject=options.rows_per_subject,
         vocab_size=options.vocab_size,
     )
+    _validate_column_generators(plan, options.column_generators)
 
     pools = _materialize_pools(plan, options)
     subject_ids: list[int] = pools[SUBJECT_POOL]
@@ -209,6 +221,39 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
             frame = _adopt_join_keys(frame, table, join, frames[join.input_prefix], options)
         frames[table.prefix] = frame
     return GeneratedDataset(plan=plan, frames=frames, timelines=timelines, truncated_metadata=truncated)
+
+
+def _validate_column_generators(
+    plan: DatasetPlan, generators: dict[tuple[str, str], ColumnGenerator]
+) -> None:
+    """Reject generator registrations that would violate a planned source relationship."""
+    source_columns = {
+        (table.prefix, column.name): column
+        for table in plan.tables
+        if not table.is_metadata
+        for column in table.columns
+    }
+    metadata_columns = {
+        (table.prefix, column.name) for table in plan.tables if table.is_metadata for column in table.columns
+    }
+    for key, generator in generators.items():
+        if key in metadata_columns:
+            raise ValueError(
+                f"column generator {key!r} targets metadata, which is generated from shared keys"
+            )
+        column = source_columns.get(key)
+        if column is None:
+            raise ValueError(f"column generator names an unknown source column {key!r}")
+        if not callable(generator):
+            raise TypeError(f"column generator for {key!r} is not callable")
+        pool = plan.pools.get(column.pool_id) if column.pool_id else None
+        if (
+            column.covers_pool
+            or column.unique_in_table
+            or column.pool_id in (SUBJECT_POOL, SUBJECT_KEY_POOL)
+            or (pool is not None and len(pool.members) > 1)
+        ):
+            raise ValueError(f"column generator {key!r} would break a shared source relationship")
 
 
 def _generation_order(plan: DatasetPlan, joins: dict) -> list[TablePlan]:
@@ -414,7 +459,8 @@ def _generate_metadata_table(
 
     data: dict[str, list] = {}
     for i, column in enumerate(key_columns):
-        data[column.name] = [str(combo[i]) for combo in combos]
+        # Match Polars' event-code stringification (Python spells some floats differently).
+        data[column.name] = pl.Series([combo[i] for combo in combos]).cast(pl.String).to_list()
     for column in other_columns:
         factory = ValueFactory(
             random.Random(f"{options.seed}:{table.prefix}:{column.name}"),
@@ -457,6 +503,18 @@ def _generate_column(
     factory = ValueFactory(rng, null_fraction=options.null_fraction, numeric_ranges=options.numeric_ranges)
     constraint = column.constraint
     kind = constraint.kind
+
+    strategy = options.column_generators.get((table.prefix, column.name))
+    if strategy is not None:
+        # Registered fragments of a timestamp share an instant per row, not independent samples.
+        # Null injection uses the separate, per-column factory RNG and cannot shift this sequence.
+        time_rng = random.Random(f"{options.seed}:{table.prefix}:registered-time")
+        try:
+            return _generate_temporal(
+                column, timelines, row_subjects, n_rows, factory, time_rng, strategy=strategy
+            )
+        except Exception as e:
+            raise ValueError(f"column generator for {(table.prefix, column.name)!r} failed: {e}") from e
 
     if column.pool_id == SUBJECT_POOL:
         return list(row_subjects)
@@ -562,6 +620,8 @@ def _generate_temporal(
     n_rows: int,
     factory: ValueFactory,
     rng: random.Random,
+    *,
+    strategy: ColumnGenerator | None = None,
 ) -> list:
     """Generate a timestamp column, honoring birth/death roles and the recorded string formats.
 
@@ -572,6 +632,7 @@ def _generate_temporal(
         n_rows: The number of rows.
         factory: The value factory (for null injection).
         rng: The random source.
+        strategy: Optional explicit renderer, applied instead of inferred formatting.
 
     Returns:
         The column's values — formatted strings when the config parses this column with
@@ -597,6 +658,11 @@ def _generate_temporal(
         if value is None:
             out.append(None)
             continue
-        rendered = format_datetime(value, constraint, i) if as_string else value
+        if strategy is not None:
+            rendered = strategy(value)
+            if rendered is None and not constraint.effective_nullable:
+                raise ValueError(f"returned null for non-nullable column at row {i}")
+        else:
+            rendered = format_datetime(value, constraint, i) if as_string else value
         out.append(factory.maybe_null(rendered, constraint.effective_nullable))
     return out

@@ -12,7 +12,7 @@ import pytest
 from MEDS_extract.config import MessyConfig
 from MEDS_extract.io import resolve_source_files
 
-from MESSY_synth import GenerationOptions, generate, synthesize
+from MESSY_synth import GenerationOptions, generate, infer_constraints, synthesize
 from MESSY_synth.constraints import ValueKind
 
 #: A config exercising every structural feature the generator has to satisfy at once: a join to a
@@ -132,6 +132,16 @@ def test_a_different_seed_changes_the_data(features_cfg):
     assert not a.frames["hosp/labs"].equals(b.frames["hosp/labs"])
 
 
+@pytest.mark.parametrize(
+    "key",
+    [("hosp/labs", "itemid"), ("hosp/labs", "stay_id"), ("hosp/d_labitems", "label")],
+)
+def test_generators_cannot_bypass_shared_keys_or_metadata(features_cfg, key):
+    """Independent callbacks must not bypass the planner's cross-file invariants."""
+    with pytest.raises(ValueError, match="shared source relationship|targets metadata"):
+        generate(features_cfg, GenerationOptions(column_generators={key: lambda value: "override"}))
+
+
 def test_written_files_resolve_through_meds_extracts_own_resolver(features_cfg, tmp_path):
     """MEDS-Extract can find every table, in exactly one layout, at the paths we wrote."""
     result = synthesize(features_cfg, tmp_path, n_subjects=16, seed=1)
@@ -220,7 +230,8 @@ def test_hashed_subject_keys_are_shared_and_sized_by_subject_count():
     assert patients == labs
 
 
-def test_numeric_metadata_key_stays_numeric_in_its_event_table(tmp_path):
+@pytest.mark.parametrize("key", [3097, 0.00001])
+def test_numeric_metadata_key_stays_numeric_in_its_event_table(tmp_path, key):
     """Metadata writes keys as text without corrupting numeric event-side keys."""
     cfg = MessyConfig.parse(
         {
@@ -228,7 +239,8 @@ def test_numeric_metadata_key_stays_numeric_in_its_event_table(tmp_path):
             "data_ref": {
                 "_defaults": {"subject_id": "$pid"},
                 "baseline": {
-                    "code": 'f"CASE_ATTR//{$FieldID}" if $FieldID == 3097',
+                    "code": 'f"CASE_ATTR//{$FieldID}" if $FieldID == '
+                    + (str(key) if isinstance(key, int) else f"{key:f}"),
                     "time": '$time::"%Y-%m-%d"',
                     "_metadata": {
                         "d_references": {
@@ -245,7 +257,64 @@ def test_numeric_metadata_key_stays_numeric_in_its_event_table(tmp_path):
 
     assert result.ok, [str(finding) for finding in result.findings]
     assert result.fmt == "csv"
-    assert result.dataset.frames["data_ref"]["FieldID"].dtype.is_integer()
+    import polars as pl
+
+    events = result.dataset.frames["data_ref"]["FieldID"]
+    metadata = result.dataset.frames["d_references"]["ReferenceGlobalID"]
+    assert events.dtype.is_integer() if isinstance(key, int) else events.dtype.is_float()
+    assert key in events.to_list()
+    assert set(events.cast(pl.String)) <= set(metadata)
+
+
+def test_registered_generators_render_interpolated_timestamp_components(tmp_path):
+    """F-string components stay opaque unless the caller explicitly supplies their renderers."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "SplitTimestamp", "raw_dataset_version": "1"},
+            "visits": {
+                "_defaults": {"subject_id": "$pid"},
+                "visit": {
+                    "code": "VISIT",
+                    "time": 'f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"',
+                },
+            },
+        }
+    )
+
+    constraints = infer_constraints(cfg)
+    assert constraints.get("visits", "date").datetime_formats == ()
+    assert constraints.get("visits", "clock").datetime_formats == ()
+
+    result = synthesize(
+        cfg,
+        tmp_path,
+        n_subjects=40,
+        null_fraction=0.0,
+        column_generators={
+            ("visits", "date"): lambda instant: instant.strftime("%Y-%m-%d"),
+            ("visits", "clock"): lambda instant: instant.strftime("%H:%M:%S"),
+        },
+    )
+
+    assert result.ok, [str(finding) for finding in result.findings]
+    assert result.events is not None
+    assert result.events["rows_out"].min() > 0
+
+
+def test_registered_generator_must_name_a_source_column():
+    """Typos in a generator registration fail before an unrelated table is written."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "Registered", "raw_dataset_version": "1"},
+            "t": {"_defaults": {"subject_id": "$pid"}, "e": {"code": "X", "time": None}},
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"unknown source column \('t', 'missing'\)"):
+        generate(
+            cfg,
+            GenerationOptions(column_generators={("t", "missing"): lambda instant: "value"}),
+        )
 
 
 def test_a_config_meds_extract_rejects_is_reported_not_raised(tmp_path):

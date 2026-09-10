@@ -30,9 +30,13 @@ from datetime import datetime, timedelta
 from random import Random
 from typing import TYPE_CHECKING
 
+import polars as pl
+
 from .regexgen import generate_match, generate_non_match
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Callable
+
     from .constraints import ColumnConstraint
 
 #: Prefix stamped on every generated categorical/identifier token, so synthetic data is obvious at
@@ -50,8 +54,24 @@ EVENT_START = datetime(2010, 1, 1)  # noqa: DTZ001
 #: Length, in days, of each subject's personal event window.
 SUBJECT_WINDOW_DAYS = 1095
 
-# ponytail: only %.f is mapped; extend this map if another ETL needs directives such as %3f.
-_CHRONO_TO_PY = {"%.f": ".%f"}
+
+def chrono_formatter(fmt: str) -> Callable[[datetime], str]:
+    """Build a column generator that renders a timeline timestamp with a Chrono format.
+
+    Args:
+        fmt: The format accepted by a MESSY ``strptime`` expression.
+
+    Returns:
+        A generator suitable for ``GenerationOptions.column_generators``.
+
+    Examples:
+        >>> chrono_formatter("%H:%M:%S")(datetime(2015, 6, 1, 13, 45, 0))
+        '13:45:00'
+        >>> chrono_formatter("%Y-%m-%d %H:%M:%S%.f")(datetime(2015, 6, 1, 13, 45, 0, 123456))
+        '2015-06-01 13:45:00.123456'
+    """
+    # Use the ETL's own format language, including precision and escaped percent signs.
+    return lambda value: pl.Series([value]).dt.strftime(fmt).item()
 
 
 @dataclass(frozen=True)
@@ -425,7 +445,4 @@ def format_datetime(value: datetime, constraint: ColumnConstraint, row_index: in
     formats = constraint.datetime_formats
     if not formats:
         return value.isoformat()
-    fmt = formats[row_index % len(formats)]
-    for chrono, python in _CHRONO_TO_PY.items():
-        fmt = fmt.replace(chrono, python)
-    return value.strftime(fmt)
+    return chrono_formatter(formats[row_index % len(formats)])(value)
