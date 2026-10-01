@@ -28,7 +28,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "pre-commit<4",
+  "pre-commit<5",
   "ruff",
   "pytest",
   "pytest-cov",
@@ -38,7 +38,7 @@ dev = [
   # hook. Pinning it here (in addition to the pre-commit hook's
   # additional_dependencies) gives a single source of truth and keeps local
   # `uv run mdformat ...` runs consistent with CI pre-commit runs.
-  "shfmt-py==3.12.0.2",
+  "shfmt-py==4.2.0",
   "pyyaml>=6.0.2",
 ]
 docs = []
