@@ -322,6 +322,19 @@ class AssembledTimestamp:
     group: str | None
     source: str
 
+    def __str__(self) -> str:
+        """Render as the expression it came from.
+
+        Returns:
+            The rendered text.
+
+        Examples:
+            >>> print(AssembledTimestamp("t", ("", " ", ""), (("d", 0, None), ("c", 0, None)), "%Y %H",
+            ...                          None, 'f"{$d} {$c}"'))
+            t: f"{$d} {$c}"::'%Y %H' (columns d, c)
+        """
+        return f"{self.prefix}: {self.source}::{self.fmt!r} (columns {', '.join(self.columns)})"
+
     @property
     def columns(self) -> tuple[str, ...]:
         """Return the distinct columns this timestamp is assembled from, in template order.

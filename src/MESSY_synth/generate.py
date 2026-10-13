@@ -105,14 +105,14 @@ class GeneratedDataset:
         assembly_conflicts: Assembled timestamps (see
             :class:`~MESSY_synth.constraints.AssembledTimestamp`) whose pieces could not be cut to fit
             in some rows, because another constraint fixed one of their columns, mapped to how many
-            rows failed. Keyed by a description naming the expression and its columns.
+            rows failed. For a ``coalesce``, the key is its first branch.
     """
 
     plan: DatasetPlan
     frames: dict[str, pl.DataFrame]
     timelines: dict[int, SubjectTimeline]
     truncated_metadata: dict[str, int] = field(default_factory=dict)
-    assembly_conflicts: dict[str, int] = field(default_factory=dict)
+    assembly_conflicts: dict[AssembledTimestamp, int] = field(default_factory=dict)
 
     def summary(self) -> pl.DataFrame:
         """Return a one-row-per-file overview of what was generated.
@@ -222,7 +222,7 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
     joins = {t.input_prefix: t.join for t in cfg.event_tables if t.join is not None}
     frames: dict[str, pl.DataFrame] = {}
     truncated: dict[str, int] = {}
-    conflicts: dict[str, int] = {}
+    conflicts: dict[AssembledTimestamp, int] = {}
     for table in _generation_order(plan, joins):
         frame = _generate_table(table, plan, pools, timelines, subject_ids, options, truncated, conflicts)
         join = joins.get(table.prefix)
@@ -407,7 +407,7 @@ def _generate_table(
     subject_ids: list[int],
     options: GenerationOptions,
     truncated: dict[str, int],
-    conflicts: dict[str, int],
+    conflicts: dict[AssembledTimestamp, int],
 ) -> pl.DataFrame:
     """Generate one file's frame.
 
@@ -458,7 +458,7 @@ def _apply_assemblies(
     row_subjects: list[int],
     n_rows: int,
     options: GenerationOptions,
-    conflicts: dict[str, int],
+    conflicts: dict[AssembledTimestamp, int],
 ) -> None:
     """Overwrite the pieces of assembled timestamps so each assembly parses under its format.
 
@@ -532,9 +532,7 @@ def _apply_assemblies(
             else:
                 failed += 1
         if failed:
-            first = alternatives[0]
-            key = f"{table.prefix}: {first.source}::{first.fmt!r} (columns {', '.join(first.columns)})"
-            conflicts[key] = conflicts.get(key, 0) + failed
+            conflicts[alternatives[0]] = conflicts.get(alternatives[0], 0) + failed
 
 
 def _row_instants(

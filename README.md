@@ -222,6 +222,11 @@ True
     Errors and events with no surviving rows fail validation. This is a check of the generated sample,
     **not proof of every possible callback output or complete branch coverage**. Lenient casts can still
     produce nulls in some rows. `generate()` alone and `synthesize(validate=False)` do not run this check.
+- Each registration gets a verdict finding named `prefix:column`: `info` "registration matches the
+    config: accepted by ..." when every event reading the column evaluates and keeps rows, or `error`
+    "registration does not match the config: ..." naming the events (or assembled timestamp) that
+    rejected it. A failing event only counts against a registration when the output slot that fails
+    (`time`, `numeric_value`, ...) reads the column.
 
 Use the same `column_generators` argument with `smoke_test()` for a full ETL run. From the CLI,
 register Chrono formats with the repeatable `--column-format PREFIX/COL=FMT` option. The column is

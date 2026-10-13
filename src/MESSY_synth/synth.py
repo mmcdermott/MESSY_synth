@@ -15,7 +15,14 @@ from typing import TYPE_CHECKING
 from MEDS_extract.config import MessyConfig
 
 from .generate import ColumnGenerator, GenerationOptions, generate
-from .validate import Finding, check_plan, dry_run, findings_from_dry_run, recommended_n_subjects
+from .validate import (
+    Finding,
+    check_plan,
+    check_registrations,
+    dry_run,
+    findings_from_dry_run,
+    recommended_n_subjects,
+)
 from .writer import resolve_format, write_dataset
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -124,16 +131,16 @@ def synthesize(
 
         >>> with tempfile.TemporaryDirectory() as d:
         ...     synthesize(cfg, d, seed=0, null_fraction=0.0).events
-        shape: (3, 5)
-        ┌──────────┬───────┬─────────┬──────────┬───────┐
-        │ table    ┆ event ┆ rows_in ┆ rows_out ┆ error │
-        │ ---      ┆ ---   ┆ ---     ┆ ---      ┆ ---   │
-        │ str      ┆ str   ┆ i64     ┆ i64      ┆ str   │
-        ╞══════════╪═══════╪═════════╪══════════╪═══════╡
-        │ patients ┆ dob   ┆ 40      ┆ 40       ┆ null  │
-        │ patients ┆ sex   ┆ 40      ┆ 40       ┆ null  │
-        │ labs     ┆ lab   ┆ 160     ┆ 160      ┆ null  │
-        └──────────┴───────┴─────────┴──────────┴───────┘
+        shape: (3, 6)
+        ┌──────────┬───────┬─────────┬──────────┬───────┬──────────────┐
+        │ table    ┆ event ┆ rows_in ┆ rows_out ┆ error ┆ failed_slots │
+        │ ---      ┆ ---   ┆ ---     ┆ ---      ┆ ---   ┆ ---          │
+        │ str      ┆ str   ┆ i64     ┆ i64      ┆ str   ┆ str          │
+        ╞══════════╪═══════╪═════════╪══════════╪═══════╪══════════════╡
+        │ patients ┆ dob   ┆ 40      ┆ 40       ┆ null  ┆ null         │
+        │ patients ┆ sex   ┆ 40      ┆ 40       ┆ null  ┆ null         │
+        │ labs     ┆ lab   ┆ 160     ┆ 160      ┆ null  ┆ null         │
+        └──────────┴───────┴─────────┴──────────┴───────┴──────────────┘
 
         With the default ``null_fraction`` some rows are dropped instead, because a null component
         of an interpolated code null-propagates under 0.7 and takes the row with it. Configs that
@@ -175,13 +182,16 @@ def synthesize(
             f"constraint (a registration, shared key, or its own format) fixes one of these columns. "
             f"Register a generator for the others, or check that the config's formats agree.",
         )
-        for where, rows in sorted(dataset.assembly_conflicts.items())
+        for where, rows in sorted((str(a), rows) for a, rows in dataset.assembly_conflicts.items())
     )
     events = None
     if validate:
         findings.extend(check_plan(cfg, dataset.plan, resolved))
         events = dry_run(cfg, output_dir)
         findings.extend(findings_from_dry_run(events))
+        findings.extend(
+            check_registrations(cfg, events, options.column_generators, dataset.assembly_conflicts)
+        )
 
     return SynthesisResult(
         dataset=dataset,

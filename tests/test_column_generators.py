@@ -174,3 +174,62 @@ def test_cli_registers_chrono_formats_for_split_timestamps(tmp_path):
     assert main([str(path), "-o", str(tmp_path / "bare"), "-q"]) == 0
     registered = ["--column-format", "t/date=%Y-%m-%d", "--column-format", "t/clock=%H:%M:%S"]
     assert main([str(path), "-o", str(tmp_path / "registered"), "-q", *registered]) == 0
+
+
+def verdicts(result):
+    """Return the per-registration findings, keyed by column."""
+    return {f.where: f for f in result.findings if "registration" in f.message}
+
+
+def test_each_registration_gets_a_matches_verdict(tmp_path):
+    """A registration that the config's expressions accept is reported as matching, by name."""
+    result = synthesize(
+        config('f"{$date} {$clock}"::?"%Y-%m-%d %H:%M:%S"'),
+        tmp_path,
+        column_generators={
+            ("t", "date"): chrono_formatter("%Y-%m-%d"),
+            ("t", "clock"): chrono_formatter("%H:%M:%S"),
+        },
+    )
+    assert result.ok, result.findings
+    found = verdicts(result)
+    assert set(found) == {"t:date", "t:clock"}
+    assert all(f.level == "info" and "matches" in f.message and "t/e" in f.message for f in found.values())
+
+
+def test_a_registration_the_config_rejects_gets_a_does_not_match_verdict(tmp_path):
+    """The verdict names the registered column and the event that rejected its values."""
+    result = synthesize(
+        config('$ts::"%Y-%m-%d"', numeric_value="$value::float64"),
+        tmp_path,
+        column_generators={
+            ("t", "ts"): chrono_formatter("%Y-%m-%d"),
+            ("t", "value"): lambda value: "not-a-number",
+        },
+    )
+    assert not result.ok
+    found = verdicts(result)
+    assert found["t:ts"].level == "info"
+    assert found["t:value"].level == "error"
+    assert "does not match" in found["t:value"].message and "t/e" in found["t:value"].message
+
+
+def test_a_registration_breaking_an_assembled_timestamp_does_not_match(tmp_path):
+    """Assembly conflicts count against the registration that caused them."""
+    result = synthesize(
+        config('f"{$date} {$clock}"::?"%Y-%m-%d %H:%M:%S"'),
+        tmp_path,
+        column_generators={("t", "date"): lambda value: "nope"},
+    )
+    assert verdicts(result)["t:date"].level == "error"
+
+
+def test_no_verdicts_without_validation(tmp_path):
+    """Verdicts come from the dry run, so skipping validation skips them."""
+    result = synthesize(
+        config('$ts::"%Y-%m-%d"'),
+        tmp_path,
+        validate=False,
+        column_generators={("t", "ts"): chrono_formatter("%Y-%m-%d")},
+    )
+    assert not verdicts(result)

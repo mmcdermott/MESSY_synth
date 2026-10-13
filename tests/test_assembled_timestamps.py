@@ -116,8 +116,8 @@ def test_an_unsatisfiable_assembly_is_reported_by_column():
         GenerationOptions(null_fraction=0.0, column_generators={("t", "date"): lambda value: "nope"}),
     )
     assert dataset.assembly_conflicts
-    (where, rows), *_ = dataset.assembly_conflicts.items()
-    assert "date" in where and "clock" in where
+    (assembly, rows), *_ = dataset.assembly_conflicts.items()
+    assert assembly.columns == ("date", "clock")
     assert rows == dataset.frames["t"].height
 
 

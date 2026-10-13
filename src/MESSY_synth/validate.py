@@ -33,8 +33,11 @@ import polars as pl
 from .constraints import ValueKind
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Iterable
+
     from MEDS_extract.config import MessyConfig
 
+    from .constraints import AssembledTimestamp
     from .plan import DatasetPlan
 
 logger = logging.getLogger(__name__)
@@ -294,7 +297,8 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
     with ``.unique()``, so rows producing byte-identical events collapse into one.
 
     Returns:
-        One row per event, with ``table``, ``event``, ``rows_in``, ``rows_out``, and ``error``.
+        One row per event, with ``table``, ``event``, ``rows_in``, ``rows_out``, ``error``, and
+        ``failed_slots`` (for an erroring event, the output slots whose expressions fail alone).
 
     Examples:
         >>> from MEDS_extract.config import MessyConfig
@@ -311,14 +315,14 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
         >>> with tempfile.TemporaryDirectory() as d:
         ...     _ = write_dataset(ds, d, write_manifest=False)
         ...     dry_run(cfg, d)
-        shape: (1, 5)
-        ┌───────┬───────┬─────────┬──────────┬───────┐
-        │ table ┆ event ┆ rows_in ┆ rows_out ┆ error │
-        │ ---   ┆ ---   ┆ ---     ┆ ---      ┆ ---   │
-        │ str   ┆ str   ┆ i64     ┆ i64      ┆ str   │
-        ╞═══════╪═══════╪═════════╪══════════╪═══════╡
-        │ labs  ┆ lab   ┆ 20      ┆ 18       ┆ null  │
-        └───────┴───────┴─────────┴──────────┴───────┘
+        shape: (1, 6)
+        ┌───────┬───────┬─────────┬──────────┬───────┬──────────────┐
+        │ table ┆ event ┆ rows_in ┆ rows_out ┆ error ┆ failed_slots │
+        │ ---   ┆ ---   ┆ ---     ┆ ---      ┆ ---   ┆ ---          │
+        │ str   ┆ str   ┆ i64     ┆ i64      ┆ str   ┆ str          │
+        ╞═══════╪═══════╪═════════╪══════════╪═══════╪══════════════╡
+        │ labs  ┆ lab   ┆ 20      ┆ 18       ┆ null  ┆ null         │
+        └───────┴───────┴─────────┴──────────┴───────┴──────────────┘
 
         Two rows of twenty are lost to the deliberate nulls injected into ``itemid``: under 0.7 a
         null component null-propagates through the interpolated code and the row is dropped. That
@@ -349,6 +353,7 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
                 "rows_in": rows_in,
                 "rows_out": 0,
                 "error": None,
+                "failed_slots": None,
             }
             try:
                 exprs = event.polars_exprs
@@ -385,6 +390,7 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
                 record["rows_out"] = int(out.select(keep.sum()).item())
             except Exception as e:
                 record["error"] = f"{type(e).__name__}: {e}"[:200]
+                record["failed_slots"] = _failed_slots(event, frame)
             rows.append(record)
 
     schema = {
@@ -393,8 +399,32 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
         "rows_in": pl.Int64,
         "rows_out": pl.Int64,
         "error": pl.String,
+        "failed_slots": pl.String,
     }
     return pl.DataFrame(rows, schema=schema) if rows else pl.DataFrame(schema=schema)
+
+
+def _failed_slots(event: object, frame: pl.DataFrame) -> str | None:
+    """Name the output slots of a failing event whose expressions fail on their own.
+
+    Args:
+        event: The MEDS-Extract event config.
+        frame: The prepared source frame.
+
+    Returns:
+        Comma-separated slot names, or None if no single slot fails (or none can be evaluated).
+    """
+    failed = []
+    try:
+        exprs = event.polars_exprs
+    except Exception:
+        return None
+    for slot, expr in exprs.items():
+        try:
+            frame.select(expr)
+        except Exception:
+            failed.append(slot)
+    return ", ".join(failed) or None
 
 
 def findings_from_dry_run(result: pl.DataFrame) -> list[Finding]:
@@ -430,4 +460,83 @@ def findings_from_dry_run(result: pl.DataFrame) -> list[Finding]:
                     f"will be missing this event entirely.",
                 )
             )
+    return findings
+
+
+def check_registrations(
+    cfg: MessyConfig,
+    result: pl.DataFrame,
+    registered: Iterable[tuple[str, str]],
+    assembly_conflicts: dict[AssembledTimestamp, int] | None = None,
+) -> list[Finding]:
+    """Report, per registered column, whether the config's expressions accept its generated values.
+
+    A registration matches when every event reading the column evaluates and keeps rows in the dry
+    run, and no assembled timestamp using the column failed to fit. Otherwise the finding names the
+    events (or assembly) that rejected it. This is a check of the generated sample, not a proof
+    about every value the generator could return.
+
+    Args:
+        cfg: The parsed MESSY config.
+        result: The frame returned by :func:`dry_run`.
+        registered: The registered ``(prefix, column)`` keys.
+        assembly_conflicts: :attr:`~MESSY_synth.generate.GeneratedDataset.assembly_conflicts`.
+
+    Returns:
+        One finding per registration: ``info`` if it matches, ``error`` if not.
+
+    Examples:
+        >>> from MEDS_extract.config import MessyConfig
+        >>> cfg = MessyConfig.parse({
+        ...     "t": {"_defaults": {"subject_id": "$pid"},
+        ...           "e": {"code": "X", "time": '$ts::"%Y-%m-%d"', "numeric_value": "$v::float64"}},
+        ... })
+        >>> res = pl.DataFrame({
+        ...     "table": ["t"], "event": ["e"], "rows_in": [10], "rows_out": [0],
+        ...     "error": ["InvalidOperationError: conversion failed"],
+        ... })
+        >>> for f in check_registrations(cfg, res, [("t", "v")]):
+        ...     print(f)
+        ERROR    t:v: registration does not match the config: t/e failed to evaluate
+        (InvalidOperationError: conversion failed).
+    """
+    from .inference import event_column_references
+
+    references = event_column_references(cfg, by_slot=True)
+    outcomes = {(row["table"], row["event"]): row for row in result.iter_rows(named=True)}
+    conflicts = assembly_conflicts or {}
+    findings: list[Finding] = []
+    for prefix, column in registered:
+        where = f"{prefix}:{column}"
+        key = (prefix, column)
+        events = sorted(event for event, slots in references.items() if any(key in r for r in slots.values()))
+        problems = []
+        for table, name in events:
+            row = outcomes.get((table, name)) or outcomes.get((table, "*"))
+            if row is None:
+                continue
+            slots = references[(table, name)]
+            if row["error"]:
+                # Blame only the slots that fail on their own, when that could be determined.
+                failed = [s for s in (row.get("failed_slots") or "").split(", ") if s]
+                if not failed or any(key in slots.get(slot, ()) for slot in failed):
+                    problems.append(f"{table}/{name} failed to evaluate ({row['error']})")
+            elif row["rows_out"] == 0 and any(key in slots.get(slot, ()) for slot in ("code", "time")):
+                problems.append(f"{table}/{name} kept 0 of {row['rows_in']} rows")
+        problems.extend(
+            f"{rows} row(s) of {assembly.source}::{assembly.fmt!r} could not be fitted around it"
+            for assembly, rows in conflicts.items()
+            if assembly.prefix == prefix and column in assembly.columns
+        )
+        if problems:
+            findings.append(
+                Finding(
+                    "error", where, "registration does not match the config: " + "; ".join(problems) + "."
+                )
+            )
+        elif events:
+            names = ", ".join(f"{table}/{name}" for table, name in events)
+            findings.append(Finding("info", where, f"registration matches the config: accepted by {names}."))
+        else:
+            findings.append(Finding("warning", where, "registration is not read by any event expression."))
     return findings
