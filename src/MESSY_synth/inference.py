@@ -29,6 +29,7 @@ missing.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from dftly.nodes import (
@@ -50,7 +51,7 @@ from dftly.nodes.base import Column, Literal, NodeBase
 from dftly.nodes.datetime import _DtAccessor
 from dftly.nodes.types import TYPES
 
-from .constraints import ColumnConstraint, ConstraintSet, ValueKind
+from .constraints import AssembledTimestamp, ColumnConstraint, ConstraintSet, ValueKind
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from MEDS_extract.config import MessyConfig, TableConfig
@@ -436,6 +437,7 @@ def _visit(
                     ).with_note(f"{note}: strptime({fmt!r})"),
                     seen,
                 )
+                _record_assembly(source, fmt, ctx, cs)
 
         case Cast():
             _visit_cast(node, expect, ctx, cs, note, seen, range_hint)
@@ -446,8 +448,14 @@ def _visit(
                 _visit(part, ValueKind.CATEGORICAL, ctx, cs, f"{note}: f-string component", seen)
 
         case Coalesce():
+            before = len(cs.assemblies)
             for arg in node.args:
                 _visit(arg, expect, ctx, cs, note, seen, range_hint)
+            # Only one branch of a coalesce has to parse, so its assemblies are alternatives.
+            grouped = [replace(a, group=f"coalesce@{id(node)}") for a in cs.assemblies[before:]]
+            cs.assemblies[before:] = []
+            for assembly in grouped:
+                cs.assemble(assembly)
             # A `?? 'UNK'` fallback is a value the slot can genuinely take, so it belongs in the
             # column's pool. That matters for a code component: without it the dictionary the code
             # joins against never contains 'UNK', and every row that fell back gets a null
@@ -902,6 +910,93 @@ def _is_duration_cast(node: NodeBase) -> bool:
     if not isinstance(node, Cast):
         return False
     return _literal_value(node.kwargs.get("type")) in _NUMERIC_SOURCE_CASTS
+
+
+def _record_assembly(source: NodeBase, fmt: object, ctx: _Context, cs: ConstraintSet) -> None:
+    """Record a parsed timestamp that is assembled from slices or several columns.
+
+    No format is ascribed to any column here. The record only says which pieces, cut how, are
+    reassembled into the string that ``fmt`` parses; generation renders whole timestamps and cuts
+    them to match. Anything not built from plain column references and non-negative literal
+    slices of one table is left alone.
+
+    Args:
+        source: The ``strptime`` source expression.
+        fmt: The parse format, if it is a literal.
+        ctx: The resolving context.
+        cs: The accumulator.
+
+    Examples:
+        >>> from dftly import Parser
+        >>> cs = ConstraintSet()
+        >>> node = Parser()('f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"')
+        >>> _record_assembly(node.kwargs["source"], node.kwargs["format"].args[0],
+        ...                  _Context("t", {}, None), cs)
+        >>> a, = cs.assemblies
+        >>> a.literals, a.pieces, a.source
+        (('', ' ', ''), (('date', 0, 10), ('clock', 0, None)), 'f"{$date[0:10]} {$clock}"')
+
+        A bare column is an ordinary formatted column, not an assembly:
+
+        >>> _record_assembly(Parser()("$ts"), "%Y", _Context("t", {}, None), cs)
+        >>> len(cs.assemblies)
+        1
+    """
+    if not isinstance(fmt, str):
+        return
+    if isinstance(source, StringInterpolate):
+        template = _literal_value(source.args[0])
+        parts = source.args[1:]
+        if not isinstance(template, str):
+            return
+        literals = tuple(template.split("{}"))
+        if len(literals) != len(parts) + 1:
+            return
+    elif isinstance(source, Substring):
+        literals, parts = ("", ""), (source,)
+    else:
+        return
+
+    pieces: list[tuple[str, int, int | None]] = []
+    owners: set[str] = set()
+    for part in parts:
+        if isinstance(part, Substring):
+            column = part.kwargs.get("source")
+            start = _literal_value(part.kwargs.get("start"))
+            stop = _literal_value(part.kwargs.get("stop")) if part.kwargs.get("stop") is not None else None
+            # Negative bounds depend on the value's length, which is exactly what is being chosen.
+            if (
+                not isinstance(start, int)
+                or start < 0
+                or (stop is not None and (not isinstance(stop, int) or stop < start))
+            ):
+                return
+        else:
+            column, start, stop = part, 0, None
+        if not isinstance(column, Column) or column.args[0] in ctx.derived:
+            return
+        pieces.append((column.args[0], start, stop))
+        owners.add(ctx.owner_of(column.args[0]))
+    if len(owners) != 1 or (literals == ("", "") and pieces[0][1:] == (0, None)):
+        return  # The second case is `f"{$ts}"`: just a formatted column.
+
+    def render(column: str, start: int, stop: int | None) -> str:
+        if (start, stop) == (0, None):
+            return f"${column}"
+        return f"${column}[{start}:{'' if stop is None else stop}]"
+
+    rendered = [render(*piece) for piece in pieces]
+    text = literals[0] + "".join(f"{{{r}}}{lit}" for r, lit in zip(rendered, literals[1:], strict=True))
+    cs.assemble(
+        AssembledTimestamp(
+            prefix=owners.pop(),
+            literals=literals,
+            pieces=tuple(pieces),
+            fmt=fmt,
+            group=None,
+            source=f'f"{text}"' if isinstance(source, StringInterpolate) else rendered[0],
+        )
+    )
 
 
 def _literal_value(node: object) -> object:

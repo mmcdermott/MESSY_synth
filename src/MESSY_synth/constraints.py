@@ -290,6 +290,48 @@ def _ordered_union(*groups: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(item for group in groups for item in group))
 
 
+@dataclass(frozen=True)
+class AssembledTimestamp:
+    """A timestamp the config builds from several source columns before parsing it.
+
+    ``f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"`` constrains the assembled string, not the
+    format of ``date`` or ``clock``. Rather than guess a per-column format, generation renders a whole
+    timestamp with :attr:`fmt` and cuts it at :attr:`literals` back into the pieces. Any cut that
+    respects the literals and slice widths reassembles into the same string, so it parses.
+
+    Attributes:
+        prefix: The source table all pieces are read from.
+        literals: The template text around the pieces; one more entry than :attr:`pieces`.
+        pieces: ``(column, start, stop)`` per interpolated piece. A bare ``$col`` is ``(col, 0,
+            None)``; ``$col[3:13]`` is ``(col, 3, 13)``.
+        fmt: The format the assembled string is parsed with.
+        group: Shared by the branches of one ``coalesce``, only one of which has to parse.
+        source: The expression, for messages.
+
+    Examples:
+        >>> a = AssembledTimestamp("t", ("", " ", ""), (("date", 0, 10), ("clock", 0, None)),
+        ...                        "%Y-%m-%d %H:%M:%S", None, 'f"{$date[0:10]} {$clock}"')
+        >>> a.columns
+        ('date', 'clock')
+    """
+
+    prefix: str
+    literals: tuple[str, ...]
+    pieces: tuple[tuple[str, int, int | None], ...]
+    fmt: str
+    group: str | None
+    source: str
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        """Return the distinct columns this timestamp is assembled from, in template order.
+
+        Returns:
+            The column names.
+        """
+        return tuple(dict.fromkeys(column for column, _, _ in self.pieces))
+
+
 @dataclass
 class ConstraintSet:
     """A mutable accumulator mapping ``(table_prefix, column)`` to its merged constraint.
@@ -314,6 +356,16 @@ class ConstraintSet:
     """
 
     constraints: dict[tuple[str, str], ColumnConstraint] = field(default_factory=dict)
+    assemblies: list[AssembledTimestamp] = field(default_factory=list)
+
+    def assemble(self, assembly: AssembledTimestamp) -> None:
+        """Record a timestamp assembled from several columns, once however often it is visited.
+
+        Args:
+            assembly: What was learned.
+        """
+        if assembly not in self.assemblies:
+            self.assemblies.append(assembly)
 
     def observe(self, prefix: str, column: str, constraint: ColumnConstraint) -> None:
         """Record one observation about ``prefix``/``column``.

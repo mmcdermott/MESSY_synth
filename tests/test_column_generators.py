@@ -153,7 +153,7 @@ def test_smoke_test_accepts_registered_generators(tmp_path):
 
 
 def test_cli_registers_chrono_formats_for_split_timestamps(tmp_path):
-    """CI runs the CLI, so split date/clock columns must be registrable without Python."""
+    """CI runs the CLI, so explicit registrations must be available there too."""
     import yaml
 
     from MESSY_synth.__main__ import main
@@ -170,6 +170,7 @@ def test_cli_registers_chrono_formats_for_split_timestamps(tmp_path):
             }
         )
     )
-    assert main([str(path), "-o", str(tmp_path / "bare"), "-q"]) == 1
+    # Split date/clock columns are cut from one rendered timestamp, so this needs no flags.
+    assert main([str(path), "-o", str(tmp_path / "bare"), "-q"]) == 0
     registered = ["--column-format", "t/date=%Y-%m-%d", "--column-format", "t/clock=%H:%M:%S"]
     assert main([str(path), "-o", str(tmp_path / "registered"), "-q", *registered]) == 0

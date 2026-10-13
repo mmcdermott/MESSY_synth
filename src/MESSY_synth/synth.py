@@ -167,6 +167,16 @@ def synthesize(
         )
         for prefix, dropped in sorted(dataset.truncated_metadata.items())
     ]
+    findings.extend(
+        Finding(
+            "warning",
+            where,
+            f"{rows} row(s) could not be generated so the assembled timestamp parses: another "
+            f"constraint (a registration, shared key, or its own format) fixes one of these columns. "
+            f"Register a generator for the others, or check that the config's formats agree.",
+        )
+        for where, rows in sorted(dataset.assembly_conflicts.items())
+    )
     events = None
     if validate:
         findings.extend(check_plan(cfg, dataset.plan, resolved))

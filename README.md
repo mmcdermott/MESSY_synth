@@ -169,11 +169,26 @@ Some of what it deduces is less obvious than a dtype:
 
 `--explain` prints all of it, per column, with the reasoning attached.
 
-## Explicit column generators
+## Timestamps assembled from several columns
 
 A parse format constrains the expression being parsed, not necessarily its source columns.
 For example, `f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"` does not declare the full
-format of `date`. Register that knowledge explicitly rather than relying on a guessed split:
+format of `date`, so no per-column format is inferred. Instead, each row gets one instant, rendered
+whole with the format the config parses (`2015-06-01 13:45:00`), and cut at the template's literal
+text into the pieces (`date = "2015-06-01"`, `clock = "13:45:00"`). Any cut that respects the
+literals reassembles into the rendered string, so it parses by construction. This covers any number
+of pieces, separators that also occur inside the format, and non-negative slices (`$raw[3:13]` gets
+filler outside the slice). A column shared by several such expressions gets one value that fits all
+of them; `coalesce` branches are alternatives. `--explain` lists every assembled timestamp.
+
+A column whose values something else owns (a registration, a shared key, a birth/death role, or its
+own `strptime` format) is kept, and the cut is fitted around it. If that is impossible, a warning
+names the expression and its columns.
+
+## Explicit column generators
+
+For representations the config cannot express, register a generator. A registered column is kept
+as-is, and assembled timestamps are cut around it:
 
 ```python
 >>> from MESSY_synth import chrono_formatter

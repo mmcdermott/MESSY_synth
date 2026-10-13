@@ -245,6 +245,11 @@ def explain(result) -> str:
             # constraint. Without them "why is this column a string?" has no answer.
             for note in c.notes:
                 lines.append(f"          <- {note}")
+        for assembly in result.dataset.plan.assemblies:
+            if assembly.prefix == table.prefix:
+                lines.append(
+                    f"      assembled: {assembly.source}::{assembly.fmt!r} (cut from one rendered timestamp)"
+                )
     return "\n".join(lines)
 
 
