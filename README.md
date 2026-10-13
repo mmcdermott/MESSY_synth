@@ -208,9 +208,18 @@ True
     **not proof of every possible callback output or complete branch coverage**. Lenient casts can still
     produce nulls in some rows. `generate()` alone and `synthesize(validate=False)` do not run this check.
 
-Use the same `column_generators` argument with `smoke_test()` for a full ETL run. Registration is
-currently a **Python API**, not a CLI option; configs requiring it must use a Python wrapper in CI.
-An override may also return a number or custom string, but this is not a general row-context/RNG API.
+Use the same `column_generators` argument with `smoke_test()` for a full ETL run. From the CLI,
+register Chrono formats with the repeatable `--column-format PREFIX/COL=FMT` option. The column is
+the text after the last `/`, so nested prefixes work:
+
+```bash
+MESSY-synth ./messy.yaml -o raw_synthetic/ \
+	--column-format visits/date=%Y-%m-%d \
+	--column-format visits/clock=%H:%M:%S
+```
+
+Other generators (prefixed strings, numbers) need the Python API. They are not a general
+row-context/RNG API.
 
 ## Smoke-testing an ETL
 

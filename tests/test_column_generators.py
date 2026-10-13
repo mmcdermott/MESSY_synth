@@ -150,3 +150,26 @@ def test_smoke_test_accepts_registered_generators(tmp_path):
         column_generators={("t", "raw"): lambda value: "TS:" + value.strftime("%Y-%m-%d")},
     )
     assert result.ok, result.summary()
+
+
+def test_cli_registers_chrono_formats_for_split_timestamps(tmp_path):
+    """CI runs the CLI, so split date/clock columns must be registrable without Python."""
+    import yaml
+
+    from MESSY_synth.__main__ import main
+
+    path = tmp_path / "messy.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "etl": {"dataset_name": "Split", "raw_dataset_version": "1"},
+                "t": {
+                    "_defaults": {"subject_id": "$pid"},
+                    "e": {"code": "X", "time": 'f"{$date} {$clock}"::?"%Y-%m-%d %H:%M:%S"'},
+                },
+            }
+        )
+    )
+    assert main([str(path), "-o", str(tmp_path / "bare"), "-q"]) == 1
+    registered = ["--column-format", "t/date=%Y-%m-%d", "--column-format", "t/clock=%H:%M:%S"]
+    assert main([str(path), "-o", str(tmp_path / "registered"), "-q", *registered]) == 0

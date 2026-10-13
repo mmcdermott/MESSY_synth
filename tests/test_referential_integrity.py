@@ -416,3 +416,39 @@ def test_a_death_role_does_not_empty_a_column_shared_with_an_ordinary_event(tmp_
     assert result.dataset.frames["adm"]["dischtime"].null_count() == 0
     yields = {row["event"]: row["rows_out"] for row in result.events.iter_rows(named=True)}
     assert yields["discharge"] == yields["admission"] == 20, yields
+
+
+def _numeric_key_cfg() -> MessyConfig:
+    """A numeric key compared against a literal and described by a metadata dictionary."""
+    return MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "NumericPool", "raw_dataset_version": "1"},
+            "data_ref": {
+                "_defaults": {"subject_id": "$pid"},
+                "baseline": {
+                    "code": 'f"CASE_ATTR//{$FieldID}" if $FieldID == 3097',
+                    "time": '$time::"%Y-%m-%d"',
+                    "_metadata": {
+                        "d_references": {"FieldID": "$ReferenceGlobalID", "description": "$ReferenceValue"}
+                    },
+                },
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [30, 60])
+def test_numeric_pool_members_are_distinct(vocab_size):
+    """A dictionary built from a numeric pool has one row per key, as a real dictionary does."""
+    dataset = generate(_numeric_key_cfg(), GenerationOptions(n_subjects=40, vocab_size=vocab_size))
+    keys = dataset.frames["d_references"]["ReferenceGlobalID"]
+    assert keys.n_unique() == keys.len() == vocab_size
+
+
+def test_numeric_pool_required_literals_survive_a_large_vocabulary():
+    """Compared-against literals keep a fixed row share however large the shared pool is."""
+    dataset = generate(
+        _numeric_key_cfg(), GenerationOptions(n_subjects=40, vocab_size=200, null_fraction=0.0)
+    )
+    field_ids = dataset.frames["data_ref"]["FieldID"]
+    assert (field_ids == 3097).mean() > 0.2

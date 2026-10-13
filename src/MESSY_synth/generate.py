@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 #: Share of rows in a numeric column that take one of the config's compared-against literals.
 REQUIRED_VALUE_SHARE = 0.35
 
+#: Draw attempts per wanted member when filling a numeric pool with distinct values.
+NUMERIC_POOL_DRAW_FACTOR = 20
+
 #: User-supplied rendering for a source column, given a coherent synthetic timestamp.
 ColumnGenerator = Callable[[datetime], object]
 
@@ -358,14 +361,22 @@ def _materialize_pools(plan: DatasetPlan, options: GenerationOptions) -> dict[st
                 )
             )
             factory = ValueFactory(rng, numeric_ranges=options.numeric_ranges)
-            pools[pool_id] = required + [
-                factory.numeric(
-                    column,
-                    integral=pool.kind is ValueKind.INTEGER,
-                    inferred_range=pool.constraint.numeric_range,
+            # Filler must be distinct: a repeated member becomes a duplicate dictionary key. A
+            # narrow range may hold fewer distinct numbers than the pool size; stop rather than
+            # loop forever, since every consumer indexes by the pool's actual length.
+            members = dict.fromkeys(required)
+            target = len(required) + max(1, pool.size - len(required))
+            for _ in range(target * NUMERIC_POOL_DRAW_FACTOR):
+                if len(members) >= target:
+                    break
+                members.setdefault(
+                    factory.numeric(
+                        column,
+                        integral=pool.kind is ValueKind.INTEGER,
+                        inferred_range=pool.constraint.numeric_range,
+                    )
                 )
-                for _ in range(max(1, pool.size - len(required)))
-            ]
+            pools[pool_id] = list(members)
         else:
             pools[pool_id] = categorical_pool(column, pool.constraint, pool.size, rng)
     return pools
@@ -498,7 +509,6 @@ def _generate_column(
     Returns:
         The column's values.
     """
-    del plan
     rng = random.Random(f"{options.seed}:{table.prefix}:{column.name}")
     factory = ValueFactory(rng, null_fraction=options.null_fraction, numeric_ranges=options.numeric_ranges)
     constraint = column.constraint
@@ -538,7 +548,26 @@ def _generate_column(
             # Enumerate rather than sample: a key value missing from the target table would leave
             # every row referencing it unmatched.
             return [pool[i % len(pool)] for i in range(n_rows)]
-        return [factory.maybe_null(rng.choice(pool), constraint.nullable) for _ in range(n_rows)]
+        planned = plan.pools[column.pool_id]
+        required = []
+        if planned.kind in (ValueKind.NUMERIC, ValueKind.INTEGER):
+            integral = planned.kind is ValueKind.INTEGER
+            required = [
+                n
+                for n in (_as_number(v, integral) for v in planned.constraint.required_values)
+                if n is not None
+            ]
+        # As for unshared numeric columns below: a uniform draw from a large pool almost never
+        # lands on the literal a branch compares against, so required values get a fixed share.
+        return [
+            factory.maybe_null(
+                required[i % len(required)]
+                if required and rng.random() < REQUIRED_VALUE_SHARE
+                else rng.choice(pool),
+                constraint.nullable,
+            )
+            for i in range(n_rows)
+        ]
 
     if kind in (ValueKind.DATETIME, ValueKind.DATE, ValueKind.DATETIME_STR):
         return _generate_temporal(column, timelines, row_subjects, n_rows, factory, rng)
