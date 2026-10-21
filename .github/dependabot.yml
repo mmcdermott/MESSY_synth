@@ -1,8 +1,11 @@
 version: 2
 updates:
-  # GitHub Actions: track action versions across workflows.
+  # GitHub Actions: track action versions across workflows. "/" only covers
+  # .github/workflows/, so the local composite actions are listed explicitly.
   - package-ecosystem: "github-actions"
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "monthly"
     # Wait 7 days after a release before opening an update PR. Mitigates
