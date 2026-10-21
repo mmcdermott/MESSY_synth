@@ -36,6 +36,13 @@ updates:
       interval: "monthly"
     cooldown:
       default-days: 7
+    # MEDS-extract (via MEDS-transforms) requires polars<2, but Dependabot bumps
+    # each direct dependency to its latest release before resolving, so it
+    # proposes polars 2.x and the whole update job fails. Drop this once
+    # MEDS-transforms supports polars 2.
+    ignore:
+      - dependency-name: "polars"
+        update-types: ["version-update:semver-major"]
     groups:
       python:
         patterns: ["*"]
