@@ -21,15 +21,25 @@ repos:
       - id: check-added-large-files
         args: [--maxkb, "800"]
 
-  # python code formatting, linting, and import sorting using ruff
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.10
+  # python code formatting, linting, and import sorting using ruff. Runs the
+  # ruff from uv.lock (via `uv run`) rather than ruff-pre-commit, so the hook and
+  # `uv run ruff ...` always agree and Dependabot's lockfile bumps cover both.
+  - repo: local
     hooks:
       # Run the formatter
       - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
       # Run the linter
       - id: ruff
-        args: ["--fix", "--exit-non-zero-on-fix"]
+        name: ruff check
+        entry: uv run ruff check --force-exclude --fix --exit-non-zero-on-fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
 
   # python docstring formatting
   - repo: https://github.com/myint/docformatter
