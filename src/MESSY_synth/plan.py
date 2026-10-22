@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 
 from dftly import Parser
 
-from .constraints import ColumnConstraint, ConstraintSet, ValueKind
+from .constraints import AssembledTimestamp, ColumnConstraint, ConstraintSet, ValueKind
 from .inference import infer_constraints
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -198,12 +198,14 @@ class DatasetPlan:
         n_subjects: The size of the shared subject universe.
         tables: Every file to write.
         pools: Value pools keyed by pool id.
+        assemblies: Timestamps the config assembles from slices or several columns of one table.
     """
 
     dataset_name: str
     n_subjects: int
     tables: tuple[TablePlan, ...]
     pools: dict[str, ValuePool] = field(default_factory=dict)
+    assemblies: tuple[AssembledTimestamp, ...] = ()
 
     def table(self, prefix: str) -> TablePlan:
         """Look up one table plan by prefix.
@@ -341,6 +343,11 @@ def build_plan(
         n_subjects=n_subjects,
         tables=tuple(sorted(tables, key=lambda t: t.prefix)),
         pools=pools,
+        assemblies=tuple(
+            a
+            for a in constraints.assemblies
+            if a.prefix in source_columns and set(a.columns) <= set(source_columns[a.prefix])
+        ),
     )
 
 

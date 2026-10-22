@@ -14,8 +14,15 @@ from typing import TYPE_CHECKING
 
 from MEDS_extract.config import MessyConfig
 
-from .generate import GenerationOptions, generate
-from .validate import Finding, check_plan, dry_run, findings_from_dry_run, recommended_n_subjects
+from .generate import ColumnGenerator, GenerationOptions, fixed_pieces, generate
+from .validate import (
+    Finding,
+    check_plan,
+    check_registrations,
+    dry_run,
+    findings_from_dry_run,
+    recommended_n_subjects,
+)
 from .writer import resolve_format, write_dataset
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -56,6 +63,20 @@ class SynthesisResult:
         return not any(f.level == "error" for f in self.findings)
 
 
+def _describe_fixed(fixed: dict[str, str]) -> str:
+    """Name the columns an assembly's cut had to fit around, and why.
+
+    Examples:
+        >>> _describe_fixed({"hr": "read as INTEGER", "tag": "compared to 'AM'"})
+        "these columns keep their own values: hr (read as INTEGER), tag (compared to 'AM')"
+        >>> _describe_fixed({})
+        "the config's formats cannot produce its literal text"
+    """
+    if not fixed:
+        return "the config's formats cannot produce its literal text"
+    return "these columns keep their own values: " + ", ".join(f"{c} ({r})" for c, r in fixed.items())
+
+
 def synthesize(
     spec: str | Path | MessyConfig,
     output_dir: str | Path,
@@ -67,6 +88,7 @@ def synthesize(
     null_fraction: float = 0.05,
     fmt: str = "auto",
     numeric_ranges: dict[str, tuple[float, float]] | None = None,
+    column_generators: dict[tuple[str, str], ColumnGenerator] | None = None,
     validate: bool = True,
 ) -> SynthesisResult:
     """Generate and write a synthetic source dataset for a MESSY config.
@@ -84,6 +106,9 @@ def synthesize(
         null_fraction: Fraction of nullable values emitted as nulls.
         fmt: One of :data:`~MESSY_synth.writer.FORMATS`.
         numeric_ranges: Per-column-name numeric bounds, overriding the default ``(1, 100)``.
+        column_generators: Explicit renderers for source columns whose representation the config
+            does not declare. The default dry run validates their generated values against the
+            config's expressions.
         validate: Whether to run the static checks and the dry run.
 
     Returns:
@@ -120,16 +145,16 @@ def synthesize(
 
         >>> with tempfile.TemporaryDirectory() as d:
         ...     synthesize(cfg, d, seed=0, null_fraction=0.0).events
-        shape: (3, 5)
-        ┌──────────┬───────┬─────────┬──────────┬───────┐
-        │ table    ┆ event ┆ rows_in ┆ rows_out ┆ error │
-        │ ---      ┆ ---   ┆ ---     ┆ ---      ┆ ---   │
-        │ str      ┆ str   ┆ i64     ┆ i64      ┆ str   │
-        ╞══════════╪═══════╪═════════╪══════════╪═══════╡
-        │ patients ┆ dob   ┆ 40      ┆ 40       ┆ null  │
-        │ patients ┆ sex   ┆ 40      ┆ 40       ┆ null  │
-        │ labs     ┆ lab   ┆ 160     ┆ 160      ┆ null  │
-        └──────────┴───────┴─────────┴──────────┴───────┘
+        shape: (3, 6)
+        ┌──────────┬───────┬─────────┬──────────┬───────┬──────────────┐
+        │ table    ┆ event ┆ rows_in ┆ rows_out ┆ error ┆ failed_slots │
+        │ ---      ┆ ---   ┆ ---     ┆ ---      ┆ ---   ┆ ---          │
+        │ str      ┆ str   ┆ i64     ┆ i64      ┆ str   ┆ str          │
+        ╞══════════╪═══════╪═════════╪══════════╪═══════╪══════════════╡
+        │ patients ┆ dob   ┆ 40      ┆ 40       ┆ null  ┆ null         │
+        │ patients ┆ sex   ┆ 40      ┆ 40       ┆ null  ┆ null         │
+        │ labs     ┆ lab   ┆ 160     ┆ 160      ┆ null  ┆ null         │
+        └──────────┴───────┴─────────┴──────────┴───────┴──────────────┘
 
         With the default ``null_fraction`` some rows are dropped instead, because a null component
         of an interpolated code null-propagates under 0.7 and takes the row with it. Configs that
@@ -147,6 +172,7 @@ def synthesize(
         vocab_size=vocab_size,
         null_fraction=null_fraction,
         numeric_ranges=dict(numeric_ranges or {}),
+        column_generators=dict(column_generators or {}),
     )
     dataset = generate(cfg, options)
     resolved = resolve_format(dataset.plan, fmt, dataset.frames)
@@ -162,11 +188,24 @@ def synthesize(
         )
         for prefix, dropped in sorted(dataset.truncated_metadata.items())
     ]
+    findings.extend(
+        Finding(
+            "warning",
+            str(assembly),
+            f"{rows} row(s) could not be generated so the assembled timestamp parses, because "
+            f"{_describe_fixed(fixed_pieces(assembly, dataset.plan, options))}. Register generators "
+            f"whose values fit the format, or check that the config's formats agree.",
+        )
+        for assembly, rows in sorted(dataset.assembly_conflicts.items(), key=lambda item: str(item[0]))
+    )
     events = None
     if validate:
         findings.extend(check_plan(cfg, dataset.plan, resolved))
         events = dry_run(cfg, output_dir)
         findings.extend(findings_from_dry_run(events))
+        findings.extend(
+            check_registrations(cfg, events, options.column_generators, dataset.assembly_conflicts)
+        )
 
     return SynthesisResult(
         dataset=dataset,

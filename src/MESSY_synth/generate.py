@@ -22,12 +22,14 @@ from __future__ import annotations
 import itertools
 import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import polars as pl
 
-from .constraints import ColumnConstraint, ValueKind
+from .constraints import AssembledTimestamp, ColumnConstraint, ValueKind
 from .plan import (
     DEFAULT_ROWS_PER_SUBJECT,
     DEFAULT_VOCAB_SIZE,
@@ -36,7 +38,7 @@ from .plan import (
     SUBJECT_POOL,
     build_plan,
 )
-from .values import ValueFactory, build_timeline, categorical_pool, format_datetime
+from .values import ValueFactory, build_timeline, categorical_pool, format_datetimes
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from MEDS_extract.config import MessyConfig
@@ -48,6 +50,12 @@ logger = logging.getLogger(__name__)
 
 #: Share of rows in a numeric column that take one of the config's compared-against literals.
 REQUIRED_VALUE_SHARE = 0.35
+
+#: Draw attempts per wanted member when filling a numeric pool with distinct values.
+NUMERIC_POOL_DRAW_FACTOR = 20
+
+#: User-supplied rendering for a source column, given a coherent synthetic timestamp.
+ColumnGenerator = Callable[[datetime], object]
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,11 @@ class GenerationOptions:
             coalescing and null-drop paths are actually exercised.
         death_probability: Fraction of subjects given a death timestamp.
         numeric_ranges: Per-column-name numeric bounds overriding the default ``(1, 100)``.
+        column_generators: Explicit renderers keyed by raw ``(prefix, column)`` pairs. Each receives
+            a synthetic timestamp; registered ordinary columns share one instant per row and direct
+            birth/death roles use their timeline bounds. Callables must be deterministic to preserve
+            reproducibility. Metadata and protected shared/subject/join keys cannot be overridden.
+            This does not alter inferred constraints; use ``synthesize`` for MESSY validation.
     """
 
     seed: int = 0
@@ -73,6 +86,7 @@ class GenerationOptions:
     null_fraction: float = 0.05
     death_probability: float = 0.3
     numeric_ranges: dict[str, tuple[float, float]] = field(default_factory=dict)
+    column_generators: dict[tuple[str, str], ColumnGenerator] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -88,12 +102,17 @@ class GeneratedDataset:
             :data:`~MESSY_synth.plan.MAX_METADATA_ROWS`, mapped to how many were dropped. Codes
             built from a dropped combination have no dictionary row, so this is surfaced as a
             finding rather than left to a log line.
+        assembly_conflicts: Assembled timestamps (see
+            :class:`~MESSY_synth.constraints.AssembledTimestamp`) whose pieces could not be cut to fit
+            in some rows, because another constraint fixed one of their columns, mapped to how many
+            rows failed. For a ``coalesce``, the key is its first branch.
     """
 
     plan: DatasetPlan
     frames: dict[str, pl.DataFrame]
     timelines: dict[int, SubjectTimeline]
     truncated_metadata: dict[str, int] = field(default_factory=dict)
+    assembly_conflicts: dict[AssembledTimestamp, int] = field(default_factory=dict)
 
     def summary(self) -> pl.DataFrame:
         """Return a one-row-per-file overview of what was generated.
@@ -191,6 +210,7 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
         rows_per_subject=options.rows_per_subject,
         vocab_size=options.vocab_size,
     )
+    _validate_column_generators(plan, options.column_generators)
 
     pools = _materialize_pools(plan, options)
     subject_ids: list[int] = pools[SUBJECT_POOL]
@@ -202,13 +222,58 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
     joins = {t.input_prefix: t.join for t in cfg.event_tables if t.join is not None}
     frames: dict[str, pl.DataFrame] = {}
     truncated: dict[str, int] = {}
+    conflicts: dict[AssembledTimestamp, int] = {}
     for table in _generation_order(plan, joins):
-        frame = _generate_table(table, plan, pools, timelines, subject_ids, options, truncated)
+        frame = _generate_table(table, plan, pools, timelines, subject_ids, options, truncated, conflicts)
         join = joins.get(table.prefix)
         if join is not None and join.input_prefix in frames:
             frame = _adopt_join_keys(frame, table, join, frames[join.input_prefix], options)
         frames[table.prefix] = frame
-    return GeneratedDataset(plan=plan, frames=frames, timelines=timelines, truncated_metadata=truncated)
+    return GeneratedDataset(
+        plan=plan,
+        frames=frames,
+        timelines=timelines,
+        truncated_metadata=truncated,
+        assembly_conflicts=conflicts,
+    )
+
+
+def _validate_column_generators(
+    plan: DatasetPlan, generators: dict[tuple[str, str], ColumnGenerator]
+) -> None:
+    """Reject generator registrations that would violate a planned source relationship."""
+    source_columns = {
+        (table.prefix, column.name): column
+        for table in plan.tables
+        if not table.is_metadata
+        for column in table.columns
+    }
+    metadata_columns = {
+        (table.prefix, column.name) for table in plan.tables if table.is_metadata for column in table.columns
+    }
+    for key, generator in generators.items():
+        if key in metadata_columns:
+            raise ValueError(
+                f"column generator {key!r} targets metadata, which is generated from shared keys"
+            )
+        column = source_columns.get(key)
+        if column is None:
+            raise ValueError(f"column generator names an unknown source column {key!r}")
+        if not callable(generator):
+            raise TypeError(f"column generator for {key!r} is not callable")
+        if _shares_a_relationship(column, plan):
+            raise ValueError(f"column generator {key!r} would break a shared source relationship")
+
+
+def _shares_a_relationship(column: ColumnPlan, plan: DatasetPlan) -> bool:
+    """Return whether a column's values are tied to another column, so must not be overwritten."""
+    pool = plan.pools.get(column.pool_id) if column.pool_id else None
+    return (
+        column.covers_pool
+        or column.unique_in_table
+        or column.pool_id in (SUBJECT_POOL, SUBJECT_KEY_POOL)
+        or (pool is not None and len(pool.members) > 1)
+    )
 
 
 def _generation_order(plan: DatasetPlan, joins: dict) -> list[TablePlan]:
@@ -303,9 +368,34 @@ def _materialize_pools(plan: DatasetPlan, options: GenerationOptions) -> dict[st
             continue
         # Name the pool after its first member column so tokens are self-describing.
         column = pool.members[0][1] if pool.members else pool_id
-        pools[pool_id] = categorical_pool(
-            column, pool.constraint, pool.size, random.Random(f"{options.seed}:pool:{pool_id}")
-        )
+        rng = random.Random(f"{options.seed}:pool:{pool_id}")
+        if pool.kind in (ValueKind.NUMERIC, ValueKind.INTEGER):
+            required = list(
+                dict.fromkeys(
+                    value
+                    for literal in pool.constraint.required_values
+                    if (value := _as_number(literal, pool.kind is ValueKind.INTEGER)) is not None
+                )
+            )
+            factory = ValueFactory(rng, numeric_ranges=options.numeric_ranges)
+            # Filler must be distinct: a repeated member becomes a duplicate dictionary key. A
+            # narrow range may hold fewer distinct numbers than the pool size; stop rather than
+            # loop forever, since every consumer indexes by the pool's actual length.
+            members = dict.fromkeys(required)
+            target = len(required) + max(1, pool.size - len(required))
+            for _ in range(target * NUMERIC_POOL_DRAW_FACTOR):
+                if len(members) >= target:
+                    break
+                members.setdefault(
+                    factory.numeric(
+                        column,
+                        integral=pool.kind is ValueKind.INTEGER,
+                        inferred_range=pool.constraint.numeric_range,
+                    )
+                )
+            pools[pool_id] = list(members)
+        else:
+            pools[pool_id] = categorical_pool(column, pool.constraint, pool.size, rng)
     return pools
 
 
@@ -317,6 +407,7 @@ def _generate_table(
     subject_ids: list[int],
     options: GenerationOptions,
     truncated: dict[str, int],
+    conflicts: dict[AssembledTimestamp, int],
 ) -> pl.DataFrame:
     """Generate one file's frame.
 
@@ -328,6 +419,7 @@ def _generate_table(
         subject_ids: The subject universe.
         options: The generation options.
         truncated: Accumulator recording metadata tables whose key product hit the row cap.
+        conflicts: Accumulator recording assembled timestamps that could not be cut to fit.
 
     Returns:
         The generated frame.
@@ -351,7 +443,262 @@ def _generate_table(
         data[column.name] = _generate_column(
             column, table, plan, pools, timelines, row_subjects, n_rows, options
         )
+    assemblies = [a for a in plan.assemblies if a.prefix == table.prefix]
+    if assemblies:
+        _apply_assemblies(assemblies, table, plan, data, timelines, row_subjects, n_rows, options, conflicts)
     return pl.DataFrame(data, strict=False)
+
+
+def _apply_assemblies(
+    assemblies: list[AssembledTimestamp],
+    table: TablePlan,
+    plan: DatasetPlan,
+    data: dict[str, list],
+    timelines: dict[int, SubjectTimeline],
+    row_subjects: list[int],
+    n_rows: int,
+    options: GenerationOptions,
+    conflicts: dict[AssembledTimestamp, int],
+) -> None:
+    """Overwrite the pieces of assembled timestamps so each assembly parses under its format.
+
+    Each row gets one instant, rendered whole with the assembly's format and cut at the template's
+    literals. No column is given a format of its own: any cut that respects the literals reassembles
+    into the rendered string. A column is left as generated (and the cut must fit around it) when
+    something else owns its values — a user registration, a shared key, a birth/death role, or its
+    own ``strptime`` format. Values already null stay null, preserving null injection.
+
+    Args:
+        assemblies: This table's assembled timestamps.
+        table: The table plan.
+        plan: The dataset plan.
+        data: The generated columns, modified in place.
+        timelines: Per-subject timelines.
+        row_subjects: The subject id assigned to each row.
+        n_rows: The number of rows.
+        options: The generation options.
+        conflicts: Accumulator for rows that could not be cut to fit.
+    """
+    columns = {column.name: column for column in table.columns}
+    free = {
+        name for name, column in columns.items() if fixed_reason(column, table.prefix, plan, options) is None
+    }
+    # The same seed as registered columns, so registered fragments and cut pieces share an instant.
+    rng = random.Random(f"{options.seed}:{table.prefix}:registered-time")
+    instants = pl.Series(_row_instants(timelines, row_subjects, n_rows, rng), dtype=pl.Datetime("us"))
+
+    # Branches of one coalesce are alternatives; every other assembly must parse on its own.
+    groups: dict[object, list[AssembledTimestamp]] = {}
+    for assembly in assemblies:
+        groups.setdefault(assembly.group or assembly, []).append(assembly)
+
+    assigned: list[set[str]] = [set() for _ in range(n_rows)]
+    for alternatives in groups.values():
+        rendered = []
+        for assembly in alternatives:
+            try:
+                rendered.append(instants.dt.strftime(assembly.fmt).to_list())
+            except Exception:  # an invalid format; the dry run reports the expression itself
+                rendered.append([None] * n_rows)
+        failed = 0
+        for i in range(n_rows):
+            for assembly, strings in zip(alternatives, rendered, strict=True):
+                current = {c: data[c][i] for c in assembly.columns}
+                nulls = {c for c, v in current.items() if v is None}
+                fixed = {
+                    c: str(v)
+                    for c, v in current.items()
+                    if c not in nulls and (c not in free or c in assigned[i])
+                }
+                cut = (
+                    None
+                    if strings[i] is None
+                    else _cut(strings[i], assembly.literals, assembly.pieces, fixed)
+                )
+                if cut is None and nulls:
+                    break  # the assembled value is null in this row anyway
+                if cut is not None:
+                    # Injected nulls stay null; the other pieces still get realistic values.
+                    for column, value in cut.items():
+                        if column not in nulls:
+                            data[column][i] = value
+                            assigned[i].add(column)
+                    break
+            else:
+                failed += 1
+        if failed:
+            conflicts[alternatives[0]] = conflicts.get(alternatives[0], 0) + failed
+
+
+#: Kinds whose values can be replaced by arbitrary text without breaking how the config reads them.
+_CUTTABLE_KINDS = frozenset({ValueKind.UNKNOWN, ValueKind.STRING, ValueKind.CATEGORICAL})
+
+
+def _constraint_fixed_reason(constraint: ColumnConstraint) -> str | None:
+    """Say why the config's own reads of a column stop an assembly from overwriting its values.
+
+    A column the config also reads as a number, date, id or flag needs values of that type, and one
+    it compares to literals or patterns needs those values to keep occurring.
+
+    Examples:
+        >>> _constraint_fixed_reason(ColumnConstraint(kind=ValueKind.STRING)) is None
+        True
+        >>> _constraint_fixed_reason(ColumnConstraint(kind=ValueKind.INTEGER))
+        'read as INTEGER'
+        >>> _constraint_fixed_reason(ColumnConstraint(kind=ValueKind.CATEGORICAL, required_values=("AM",)))
+        "compared to 'AM'"
+        >>> _constraint_fixed_reason(ColumnConstraint(match_patterns=("^A",)))
+        'matched against a pattern'
+    """
+    if constraint.kind not in _CUTTABLE_KINDS:
+        return f"read as {constraint.kind.name}"
+    if constraint.required_values:
+        return "compared to " + ", ".join(repr(v) for v in constraint.required_values)
+    if constraint.match_patterns or constraint.extract_patterns:
+        return "matched against a pattern"
+    return None
+
+
+def fixed_reason(
+    column: ColumnPlan, prefix: str, plan: DatasetPlan, options: GenerationOptions
+) -> str | None:
+    """Say why an assembled timestamp may not overwrite a column's values, or None if it may.
+
+    A fixed column is left as generated and the cut must fit around it; rows where none fits are
+    reported as conflicts.
+
+    Args:
+        column: The column plan.
+        prefix: The column's table prefix.
+        plan: The dataset plan.
+        options: The generation options, supplying registrations.
+
+    Returns:
+        A short reason, or None when the column is free to be cut.
+    """
+    if (prefix, column.name) in options.column_generators:
+        return "registered"
+    if _shares_a_relationship(column, plan):
+        return "a shared key"
+    if column.constraint.effective_temporal_role is not None:
+        return f"a {column.constraint.effective_temporal_role} time"
+    return _constraint_fixed_reason(column.constraint)
+
+
+def fixed_pieces(
+    assembly: AssembledTimestamp, plan: DatasetPlan, options: GenerationOptions
+) -> dict[str, str]:
+    """Map each column of an assembled timestamp the cut must fit around to why it is fixed."""
+    table = next(t for t in plan.tables if t.prefix == assembly.prefix)
+    columns = {column.name: column for column in table.columns}
+    reasons = {name: fixed_reason(columns[name], table.prefix, plan, options) for name in assembly.columns}
+    return {name: reason for name, reason in reasons.items() if reason is not None}
+
+
+def _row_instants(
+    timelines: dict[int, SubjectTimeline], row_subjects: list[int], n_rows: int, rng: random.Random
+) -> list[datetime]:
+    """Draw one ordinary event instant per row, as :func:`_generate_temporal` does."""
+    out = []
+    for i in range(n_rows):
+        subject = row_subjects[i] if i < len(row_subjects) else None
+        timeline = timelines.get(subject) if subject is not None else None
+        if timeline is None:
+            timeline = build_timeline(0, random.Random(f"anon:{i}"))
+        out.append(timeline.sample(rng))
+    return out
+
+
+#: Filler for the characters of a column outside every slice the config reads.
+ASSEMBLY_PAD = "_"
+
+#: A column value being cut: its known characters by position, and its length if pinned.
+_Span = tuple[dict[int, str], int | None]
+
+
+def _cut(
+    rendered: str,
+    literals: tuple[str, ...],
+    pieces: tuple[tuple[str, int, int | None], ...],
+    fixed: dict[str, str],
+) -> dict[str, str] | None:
+    """Cut a rendered timestamp into column values that reassemble into it.
+
+    Args:
+        rendered: The whole timestamp, rendered with the assembly's format.
+        literals: The template text around the pieces.
+        pieces: ``(column, start, stop)`` per piece.
+        fixed: Values that must be kept as they are.
+
+    Returns:
+        The new value of each non-fixed column, or None if no cut fits.
+
+    Examples:
+        >>> _cut("2015-06-01 13:45:00", ("", " ", ""), (("date", 0, 10), ("clock", 0, None)), {})
+        {'date': '2015-06-01', 'clock': '13:45:00'}
+
+        Separators that also occur inside the timestamp are not a problem:
+
+        >>> _cut("2015-06-01", ("", "-", "-", ""), (("y", 0, None), ("m", 0, None), ("d", 0, None)), {})
+        {'y': '2015', 'm': '06', 'd': '01'}
+
+        Characters outside the slice are padding, and a fixed value is fitted around:
+
+        >>> _cut("2015-06-01", ("", ""), (("raw", 3, 13),), {})
+        {'raw': '___2015-06-01'}
+        >>> _cut("2015-06-01 13:45", ("", " ", ""), (("d", 0, None), ("t", 0, None)), {"d": "2015-06-01"})
+        {'t': '13:45'}
+        >>> _cut("2015-06-01 13:45", ("", " ", ""), (("d", 0, None), ("t", 0, None)), {"d": "nope"}) is None
+        True
+
+        Two slices of one column must agree on a single value:
+
+        >>> _cut("2015/06", ("", "/", ""), (("s", 0, 4), ("s", 5, 7)), {})
+        {'s': '2015_06'}
+    """
+
+    def place(span: _Span | None, start: int, stop: int | None, piece: str) -> _Span | None:
+        chars, end = span if span is not None else ({}, None)
+        new_end = start + len(piece) if stop is None else None
+        if end is not None and new_end is not None and end != new_end:
+            return None
+        end = end if new_end is None else new_end
+        merged = dict(chars)
+        for offset, char in enumerate(piece):
+            if merged.setdefault(start + offset, char) != char:
+                return None
+        if end is not None and any(position >= end for position in merged):
+            return None
+        return merged, end
+
+    def walk(i: int, pos: int, spans: dict[str, _Span]) -> dict[str, _Span] | None:
+        if not rendered.startswith(literals[i], pos):
+            return None
+        pos += len(literals[i])
+        if i == len(pieces):
+            return spans if pos == len(rendered) else None
+        column, start, stop = pieces[i]
+        if column in fixed:
+            piece = fixed[column][start:stop]
+            return walk(i + 1, pos + len(piece), spans) if rendered.startswith(piece, pos) else None
+        # Shortest piece first; an empty one would be read back from CSV as null.
+        ends = [pos + stop - start] if stop is not None else range(pos + 1, len(rendered) + 1)
+        for end in ends:
+            if end <= pos or end > len(rendered):
+                continue
+            span = place(spans.get(column), start, stop, rendered[pos:end])
+            if span is not None and (found := walk(i + 1, end, {**spans, column: span})) is not None:
+                return found
+        return None
+
+    spans = walk(0, 0, {})
+    if spans is None:
+        return None
+    out = {}
+    for column, (chars, end) in spans.items():
+        length = end if end is not None else max(chars) + 1
+        out[column] = "".join(chars.get(position, ASSEMBLY_PAD) for position in range(length))
+    return out
 
 
 def _generate_metadata_table(
@@ -397,7 +744,8 @@ def _generate_metadata_table(
 
     data: dict[str, list] = {}
     for i, column in enumerate(key_columns):
-        data[column.name] = [combo[i] for combo in combos]
+        # Match Polars' event-code stringification (Python spells some floats differently).
+        data[column.name] = pl.Series([combo[i] for combo in combos]).cast(pl.String).to_list()
     for column in other_columns:
         factory = ValueFactory(
             random.Random(f"{options.seed}:{table.prefix}:{column.name}"),
@@ -435,11 +783,22 @@ def _generate_column(
     Returns:
         The column's values.
     """
-    del plan
     rng = random.Random(f"{options.seed}:{table.prefix}:{column.name}")
     factory = ValueFactory(rng, null_fraction=options.null_fraction, numeric_ranges=options.numeric_ranges)
     constraint = column.constraint
     kind = constraint.kind
+
+    strategy = options.column_generators.get((table.prefix, column.name))
+    if strategy is not None:
+        # Registered fragments of a timestamp share an instant per row, not independent samples.
+        # Null injection uses the separate, per-column factory RNG and cannot shift this sequence.
+        time_rng = random.Random(f"{options.seed}:{table.prefix}:registered-time")
+        try:
+            return _generate_temporal(
+                column, timelines, row_subjects, n_rows, factory, time_rng, strategy=strategy
+            )
+        except Exception as e:
+            raise ValueError(f"column generator for {(table.prefix, column.name)!r} failed: {e}") from e
 
     if column.pool_id == SUBJECT_POOL:
         return list(row_subjects)
@@ -463,7 +822,26 @@ def _generate_column(
             # Enumerate rather than sample: a key value missing from the target table would leave
             # every row referencing it unmatched.
             return [pool[i % len(pool)] for i in range(n_rows)]
-        return [factory.maybe_null(rng.choice(pool), constraint.nullable) for _ in range(n_rows)]
+        planned = plan.pools[column.pool_id]
+        required = []
+        if planned.kind in (ValueKind.NUMERIC, ValueKind.INTEGER):
+            integral = planned.kind is ValueKind.INTEGER
+            required = [
+                n
+                for n in (_as_number(v, integral) for v in planned.constraint.required_values)
+                if n is not None
+            ]
+        # As for unshared numeric columns below: a uniform draw from a large pool almost never
+        # lands on the literal a branch compares against, so required values get a fixed share.
+        return [
+            factory.maybe_null(
+                required[i % len(required)]
+                if required and rng.random() < REQUIRED_VALUE_SHARE
+                else rng.choice(pool),
+                constraint.nullable,
+            )
+            for i in range(n_rows)
+        ]
 
     if kind in (ValueKind.DATETIME, ValueKind.DATE, ValueKind.DATETIME_STR):
         return _generate_temporal(column, timelines, row_subjects, n_rows, factory, rng)
@@ -545,6 +923,8 @@ def _generate_temporal(
     n_rows: int,
     factory: ValueFactory,
     rng: random.Random,
+    *,
+    strategy: ColumnGenerator | None = None,
 ) -> list:
     """Generate a timestamp column, honoring birth/death roles and the recorded string formats.
 
@@ -555,6 +935,7 @@ def _generate_temporal(
         n_rows: The number of rows.
         factory: The value factory (for null injection).
         rng: The random source.
+        strategy: Optional explicit renderer, applied instead of inferred formatting.
 
     Returns:
         The column's values — formatted strings when the config parses this column with
@@ -580,6 +961,14 @@ def _generate_temporal(
         if value is None:
             out.append(None)
             continue
-        rendered = format_datetime(value, constraint, i) if as_string else value
+        if strategy is not None:
+            rendered = strategy(value)
+            if rendered is None and not constraint.effective_nullable:
+                raise ValueError(f"returned null for non-nullable column at row {i}")
+        else:
+            rendered = value
         out.append(factory.maybe_null(rendered, constraint.effective_nullable))
+    if as_string and strategy is None:
+        # Formatted for the whole column at once; null injection above does not depend on the value.
+        out = format_datetimes(out, constraint)
     return out
