@@ -38,7 +38,7 @@ from .plan import (
     SUBJECT_POOL,
     build_plan,
 )
-from .values import ValueFactory, build_timeline, categorical_pool, format_datetime
+from .values import ValueFactory, build_timeline, categorical_pool, format_datetimes
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from MEDS_extract.config import MessyConfig
@@ -906,6 +906,9 @@ def _generate_temporal(
             if rendered is None and not constraint.effective_nullable:
                 raise ValueError(f"returned null for non-nullable column at row {i}")
         else:
-            rendered = format_datetime(value, constraint, i) if as_string else value
+            rendered = value
         out.append(factory.maybe_null(rendered, constraint.effective_nullable))
+    if as_string and strategy is None:
+        # Formatted for the whole column at once; null injection above does not depend on the value.
+        out = format_datetimes(out, constraint)
     return out
