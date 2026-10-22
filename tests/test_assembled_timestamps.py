@@ -139,3 +139,38 @@ def test_a_template_the_format_can_never_produce_is_reported(tmp_path):
     result = synthesize(config('f"{$a} {$b}"::"%Y%m%d%H%M%S"'), tmp_path, null_fraction=0.0)
     assert not result.ok
     assert any(f.level == "warning" and "columns a, b" in f.where for f in result.findings)
+
+
+def test_a_numeric_piece_stays_numeric(tmp_path):
+    """A piece the config also compares numerically keeps its numeric values, so that event still works."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "Assembled", "raw_dataset_version": "1"},
+            "t": {
+                "_defaults": {"subject_id": "$pid"},
+                "stamp": {"code": "X", "time": 'f"{$d} {$hr}:{$mi}"::"%Y-%m-%d %H:%M"'},
+                "big_hr": {"code": '"BIG" if $hr > 50 else "SMALL"', "time": "$ts"},
+            },
+        }
+    )
+    result = synthesize(cfg, tmp_path, seed=0, null_fraction=0.0)
+    big_hr = result.events.filter(event="big_hr").row(0, named=True)
+    assert big_hr["error"] is None, big_hr["error"]
+    assert big_hr["rows_out"] > 0
+
+
+def test_a_required_literal_survives_assembly(tmp_path):
+    """A literal the config compares a piece to keeps its rows, or the conflict is reported."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "Assembled", "raw_dataset_version": "1"},
+            "t": {
+                "_defaults": {"subject_id": "$pid"},
+                "stamp": {"code": "X", "time": 'f"{$d} {$tag}"::"%Y-%m-%d %H:%M"'},
+                "special": {"code": '"SPECIAL" if $tag == "AM" else "OTHER"', "time": "$ts"},
+            },
+        }
+    )
+    result = synthesize(cfg, tmp_path, seed=0, null_fraction=0.0)
+    n_am = (result.dataset.frames["t"]["tag"] == "AM").sum()
+    assert n_am > 0 or not result.ok, "SPECIAL branch can never fire, yet synthesize() reports ok"
