@@ -13,6 +13,7 @@ import logging
 import sys
 
 from .synth import synthesize
+from .values import chrono_formatter
 from .writer import FORMATS
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
 
         >>> parser.parse_args(["m.yaml", "-o", "o", "-R", "anchor_year=1950:2000"]).numeric_range
         [('anchor_year', (1950.0, 2000.0))]
+
+        Column formats are keyed by the raw ``(prefix, column)`` pair:
+
+        >>> parser.parse_args(["m.yaml", "-o", "o", "--column-format", "lab/time=%H:%M"]).column_format
+        [(('lab', 'time'), '%H:%M')]
     """
     parser = argparse.ArgumentParser(
         prog="MESSY-synth",
@@ -77,6 +83,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="COL=LO:HI",
         help="Override the numeric range for a column, e.g. anchor_year=1950:2000. Repeatable.",
     )
+    parser.add_argument(
+        "--column-format",
+        action="append",
+        type=_parse_column_format,
+        default=[],
+        metavar="PREFIX/COL=FMT",
+        help=(
+            "Render a source column with a Chrono datetime format, for columns the config only uses "
+            "as part of a larger expression (e.g. a date and a clock column joined in an f-string). "
+            "The dry run checks the result. Repeatable."
+        ),
+    )
     parser.add_argument("--explain", action="store_true", help="Print the inferred schema per column.")
     parser.add_argument("--no-validate", action="store_true", help="Skip static checks and the dry run.")
     parser.add_argument("-q", "--quiet", action="store_true", help="Only print errors.")
@@ -113,6 +131,35 @@ def _parse_range(text: str) -> tuple[str, tuple[float, float]]:
         raise argparse.ArgumentTypeError(f"Expected numeric bounds in {text!r}: {e}") from e
 
 
+def _parse_column_format(text: str) -> tuple[tuple[str, str], str]:
+    """Parse a ``PREFIX/COL=FMT`` column-format registration.
+
+    The prefix may itself contain slashes; the column is everything after the last one.
+
+    Args:
+        text: The raw argument text.
+
+    Returns:
+        The ``(prefix, column)`` key and its format.
+
+    Raises:
+        argparse.ArgumentTypeError: If the text is malformed.
+
+    Examples:
+        >>> _parse_column_format("data/nw_hosp/labevents/charttime=%Y-%m-%d %H:%M:%S")
+        (('data/nw_hosp/labevents', 'charttime'), '%Y-%m-%d %H:%M:%S')
+        >>> _parse_column_format("time=%H:%M")
+        Traceback (most recent call last):
+            ...
+        argparse.ArgumentTypeError: Expected PREFIX/COL=FMT, got 'time=%H:%M'
+    """
+    key, _, fmt = text.partition("=")
+    prefix, _, column = key.rpartition("/")
+    if not prefix or not column or not fmt:
+        raise argparse.ArgumentTypeError(f"Expected PREFIX/COL=FMT, got {text!r}")
+    return (prefix, column), fmt
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI.
 
@@ -139,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
             null_fraction=args.null_fraction,
             fmt=args.format,
             numeric_ranges=dict(args.numeric_range),
+            column_generators={key: chrono_formatter(fmt) for key, fmt in args.column_format},
             validate=not args.no_validate,
         )
     except Exception as e:

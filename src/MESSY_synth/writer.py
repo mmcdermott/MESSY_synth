@@ -130,8 +130,9 @@ def resolve_format(
     Args:
         plan: The dataset plan.
         fmt: One of :data:`FORMATS`.
-        frames: The generated frames. When given, ``auto`` additionally verifies that a CSV round
-            trip preserves every dtype, which catches value-level hazards the plan cannot see.
+        frames: The generated frames. When given, ``auto`` additionally verifies every non-metadata
+            frame survives a CSV round trip, catching value-level hazards the plan cannot see.
+            Metadata is always read as text by MEDS-Extract.
 
     Returns:
         ``"csv"``, ``"csv.gz"``, or ``"parquet"``.
@@ -167,7 +168,9 @@ def resolve_format(
         return fmt
     if needs_real_dtypes(plan):
         return "parquet"
-    if frames and any(csv_would_retype(f) for f in frames.values()):
+    if frames and any(
+        csv_would_retype(frame) for prefix, frame in frames.items() if not plan.table(prefix).is_metadata
+    ):
         return "parquet"
     return "csv"
 
