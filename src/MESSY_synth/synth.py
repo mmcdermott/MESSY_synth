@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from MEDS_extract.config import MessyConfig
 
-from .generate import ColumnGenerator, GenerationOptions, generate
+from .generate import ColumnGenerator, GenerationOptions, fixed_pieces, generate
 from .validate import (
     Finding,
     check_plan,
@@ -61,6 +61,20 @@ class SynthesisResult:
             True if no finding has level ``"error"``.
         """
         return not any(f.level == "error" for f in self.findings)
+
+
+def _describe_fixed(fixed: dict[str, str]) -> str:
+    """Name the columns an assembly's cut had to fit around, and why.
+
+    Examples:
+        >>> _describe_fixed({"hr": "read as INTEGER", "tag": "compared to 'AM'"})
+        "these columns keep their own values: hr (read as INTEGER), tag (compared to 'AM')"
+        >>> _describe_fixed({})
+        "the config's formats cannot produce its literal text"
+    """
+    if not fixed:
+        return "the config's formats cannot produce its literal text"
+    return "these columns keep their own values: " + ", ".join(f"{c} ({r})" for c, r in fixed.items())
 
 
 def synthesize(
@@ -177,12 +191,12 @@ def synthesize(
     findings.extend(
         Finding(
             "warning",
-            where,
-            f"{rows} row(s) could not be generated so the assembled timestamp parses: another "
-            f"constraint (a registration, shared key, or its own format) fixes one of these columns. "
-            f"Register a generator for the others, or check that the config's formats agree.",
+            str(assembly),
+            f"{rows} row(s) could not be generated so the assembled timestamp parses, because "
+            f"{_describe_fixed(fixed_pieces(assembly, dataset.plan, options))}. Register generators "
+            f"whose values fit the format, or check that the config's formats agree.",
         )
-        for where, rows in sorted((str(a), rows) for a, rows in dataset.assembly_conflicts.items())
+        for assembly, rows in sorted(dataset.assembly_conflicts.items(), key=lambda item: str(item[0]))
     )
     events = None
     if validate:

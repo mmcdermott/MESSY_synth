@@ -157,6 +157,7 @@ def test_a_numeric_piece_stays_numeric(tmp_path):
     big_hr = result.events.filter(event="big_hr").row(0, named=True)
     assert big_hr["error"] is None, big_hr["error"]
     assert big_hr["rows_out"] > 0
+    assert any(f.level == "warning" and "hr (read as INTEGER)" in str(f) for f in result.findings)
 
 
 def test_a_required_literal_survives_assembly(tmp_path):
@@ -174,3 +175,4 @@ def test_a_required_literal_survives_assembly(tmp_path):
     result = synthesize(cfg, tmp_path, seed=0, null_fraction=0.0)
     n_am = (result.dataset.frames["t"]["tag"] == "AM").sum()
     assert n_am > 0 or not result.ok, "SPECIAL branch can never fire, yet synthesize() reports ok"
+    assert any(f.level == "warning" and "tag (compared to 'AM')" in str(f) for f in result.findings)

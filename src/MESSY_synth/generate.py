@@ -481,12 +481,7 @@ def _apply_assemblies(
     """
     columns = {column.name: column for column in table.columns}
     free = {
-        name
-        for name, column in columns.items()
-        if (table.prefix, name) not in options.column_generators
-        and not _shares_a_relationship(column, plan)
-        and column.constraint.effective_temporal_role is None
-        and column.constraint.kind not in (ValueKind.DATETIME, ValueKind.DATE, ValueKind.DATETIME_STR)
+        name for name, column in columns.items() if fixed_reason(column, table.prefix, plan, options) is None
     }
     # The same seed as registered columns, so registered fragments and cut pieces share an instant.
     rng = random.Random(f"{options.seed}:{table.prefix}:registered-time")
@@ -533,6 +528,71 @@ def _apply_assemblies(
                 failed += 1
         if failed:
             conflicts[alternatives[0]] = conflicts.get(alternatives[0], 0) + failed
+
+
+#: Kinds whose values can be replaced by arbitrary text without breaking how the config reads them.
+_CUTTABLE_KINDS = frozenset({ValueKind.UNKNOWN, ValueKind.STRING, ValueKind.CATEGORICAL})
+
+
+def _constraint_fixed_reason(constraint: ColumnConstraint) -> str | None:
+    """Say why the config's own reads of a column stop an assembly from overwriting its values.
+
+    A column the config also reads as a number, date, id or flag needs values of that type, and one
+    it compares to literals or patterns needs those values to keep occurring.
+
+    Examples:
+        >>> _constraint_fixed_reason(ColumnConstraint(kind=ValueKind.STRING)) is None
+        True
+        >>> _constraint_fixed_reason(ColumnConstraint(kind=ValueKind.INTEGER))
+        'read as INTEGER'
+        >>> _constraint_fixed_reason(ColumnConstraint(kind=ValueKind.CATEGORICAL, required_values=("AM",)))
+        "compared to 'AM'"
+        >>> _constraint_fixed_reason(ColumnConstraint(match_patterns=("^A",)))
+        'matched against a pattern'
+    """
+    if constraint.kind not in _CUTTABLE_KINDS:
+        return f"read as {constraint.kind.name}"
+    if constraint.required_values:
+        return "compared to " + ", ".join(repr(v) for v in constraint.required_values)
+    if constraint.match_patterns or constraint.extract_patterns:
+        return "matched against a pattern"
+    return None
+
+
+def fixed_reason(
+    column: ColumnPlan, prefix: str, plan: DatasetPlan, options: GenerationOptions
+) -> str | None:
+    """Say why an assembled timestamp may not overwrite a column's values, or None if it may.
+
+    A fixed column is left as generated and the cut must fit around it; rows where none fits are
+    reported as conflicts.
+
+    Args:
+        column: The column plan.
+        prefix: The column's table prefix.
+        plan: The dataset plan.
+        options: The generation options, supplying registrations.
+
+    Returns:
+        A short reason, or None when the column is free to be cut.
+    """
+    if (prefix, column.name) in options.column_generators:
+        return "registered"
+    if _shares_a_relationship(column, plan):
+        return "a shared key"
+    if column.constraint.effective_temporal_role is not None:
+        return f"a {column.constraint.effective_temporal_role} time"
+    return _constraint_fixed_reason(column.constraint)
+
+
+def fixed_pieces(
+    assembly: AssembledTimestamp, plan: DatasetPlan, options: GenerationOptions
+) -> dict[str, str]:
+    """Map each column of an assembled timestamp the cut must fit around to why it is fixed."""
+    table = next(t for t in plan.tables if t.prefix == assembly.prefix)
+    columns = {column.name: column for column in table.columns}
+    reasons = {name: fixed_reason(columns[name], table.prefix, plan, options) for name in assembly.columns}
+    return {name: reason for name, reason in reasons.items() if reason is not None}
 
 
 def _row_instants(
