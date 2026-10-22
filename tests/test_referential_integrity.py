@@ -138,7 +138,7 @@ def test_a_different_seed_changes_the_data(features_cfg):
 )
 def test_generators_cannot_bypass_shared_keys_or_metadata(features_cfg, key):
     """Independent callbacks must not bypass the planner's cross-file invariants."""
-    with pytest.raises(ValueError, match="shared source relationship|targets metadata"):
+    with pytest.raises(ValueError, match=r"shared source relationship|targets metadata"):
         generate(features_cfg, GenerationOptions(column_generators={key: lambda value: "override"}))
 
 
