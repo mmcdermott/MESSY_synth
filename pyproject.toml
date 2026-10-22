@@ -48,6 +48,7 @@ docs = []
 [project.optional-dependencies]
 
 [project.scripts]
+MESSY_synth = "MESSY_synth.__main__:main"
 MESSY-synth = "MESSY_synth.__main__:main"
 
 [tool.pytest.ini_options]
