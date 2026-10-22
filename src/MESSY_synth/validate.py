@@ -282,7 +282,8 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
     This is the check that catches silent emptiness. It reproduces what
     ``convert_to_MEDS_events`` does — scan the table, apply the join, materialize ``subject_id``
     and ``_table.cols``, then evaluate each event's ``code`` and ``time`` — and reports how many
-    rows survive with a usable code.
+    rows survive with a usable code. It also runs MEDS-Extract's event extraction to validate all
+    value expressions, rather than silently ignoring a failing numeric or text cast.
 
     Args:
         cfg: The parsed MESSY config.
@@ -378,6 +379,9 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
                         rows.append(record)
                         continue
                     keep = keep & pl.col("time").is_not_null()
+                # Exercise the real extraction path, including numeric/text/extra columns. Keep
+                # the source-row count above: extract() deduplicates and can legitimately be smaller.
+                event.extract(frame.lazy(), f"{table.input_prefix}/{event.name}").collect()
                 record["rows_out"] = int(out.select(keep.sum()).item())
             except Exception as e:
                 record["error"] = f"{type(e).__name__}: {e}"[:200]
