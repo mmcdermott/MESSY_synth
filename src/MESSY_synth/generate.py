@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from .constraints import ColumnConstraint, ValueKind
-from .inference import table_joins
 from .plan import (
     DEFAULT_ROWS_PER_SUBJECT,
     DEFAULT_VOCAB_SIZE,
@@ -200,7 +199,7 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
         for sid in subject_ids
     }
 
-    joins = {t.input_prefix: table_joins(t) for t in cfg.event_tables if table_joins(t)}
+    joins = {t.input_prefix: t.joins for t in cfg.event_tables if t.joins}
     frames: dict[str, pl.DataFrame] = {}
     truncated: dict[str, int] = {}
     for table in _generation_order(plan, joins):
@@ -260,8 +259,8 @@ def _adopt_join_keys(
     universe, and overwriting it would break the round-robin assignment that gives every subject a
     row — and, in a subject-level table, would put two rows on one subject.
 
-    A table with several joins (MEDS-Extract 0.8) adopts from each target in turn, drawing from one
-    random stream, so a single-join table draws exactly what it did before multi-join support.
+    A table with several joins adopts from each target in turn, drawing from one random stream, so a
+    single-join table draws exactly what it did before multi-join support.
 
     Args:
         frame: The freshly generated frame.

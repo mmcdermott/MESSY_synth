@@ -1,4 +1,4 @@
-"""Generate structurally-faithful synthetic raw data from any MEDS-Extract v0.7 MESSY config.
+"""Generate structurally-faithful synthetic raw data from any MEDS-Extract v0.8 MESSY config.
 
 A MESSY config is a complete, config-only ETL: it says where the raw data comes from, and how to
 turn each raw table into MEDS events, using the `dftly <https://github.com/mmcdermott/dftly>`_

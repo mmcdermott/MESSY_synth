@@ -14,7 +14,6 @@ from MEDS_extract.io import resolve_source_files
 
 from MESSY_synth import GenerationOptions, generate, synthesize
 from MESSY_synth.constraints import ValueKind
-from MESSY_synth.inference import table_joins
 
 #: A config exercising every structural feature the generator has to satisfy at once: a join to a
 #: dimension table, an aggregated join, derived `_table.cols`, nested prefixes, a metadata
@@ -92,7 +91,7 @@ def test_join_keys_resolve_on_the_far_side(features_cfg):
     """No join key dangles: MEDS-Extract left joins would silently drop those rows."""
     dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
     for table in features_cfg.event_tables:
-        for join in table_joins(table):
+        for join in table.joins:
             left = dataset.frames[table.input_prefix]
             right = dataset.frames[join.input_prefix]
             for lkey, rkey in zip(join.left_on, join.right_on, strict=True):
@@ -120,7 +119,7 @@ def test_a_table_joining_two_targets_resolves_both(tmp_path):
         }
     )
     labs = next(t for t in cfg.event_tables if t.input_prefix == "labs")
-    assert [j.input_prefix for j in table_joins(labs)] == ["stays", "admissions"]
+    assert [j.input_prefix for j in labs.joins] == ["stays", "admissions"]
 
     dataset = generate(cfg, GenerationOptions(seed=0, n_subjects=16))
     left = dataset.frames["labs"]

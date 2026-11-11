@@ -367,7 +367,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "dftly", specifier = ">=0.7.0,<0.8" },
-    { name = "meds-extract", specifier = ">=0.7.0,<0.9" },
+    { name = "meds-extract", specifier = ">=0.8.0,<0.9" },
     { name = "polars", specifier = ">=1.38" },
 ]
 

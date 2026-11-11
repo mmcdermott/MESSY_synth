@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MESSY_synth#license)
 
 **Generate synthetic raw data that matches the shape a [MEDS-Extract](https://github.com/mmcdermott/MEDS_extract)
-v0.7 or v0.8 MESSY config expects — then run the whole ETL over it, with no access to the real dataset.**
+v0.8 MESSY config expects — then run the whole ETL over it, with no access to the real dataset.**
 
 A MESSY file is a complete, config-only ETL. It declares where the raw data comes from and how each
 raw table becomes MEDS events, written in the [dftly](https://github.com/mmcdermott/dftly)

@@ -1,6 +1,6 @@
 """Infer a synthetic source schema by walking the dftly expressions in a MESSY config.
 
-A MEDS-Extract v0.7 MESSY config describes an ETL as expressions *over* raw source columns. It
+A MEDS-Extract v0.8 MESSY config describes an ETL as expressions *over* raw source columns. It
 never declares those columns' types — the raw files are supposed to already exist. To synthesize
 inputs we have to run that reasoning backwards: read the expressions, and deduce what the files
 must have contained for the expressions to make sense.
@@ -56,33 +56,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from MEDS_extract.config import MessyConfig, TableConfig
 
 logger = logging.getLogger(__name__)
-
-
-def table_joins(table: TableConfig) -> tuple:
-    """Return a table's joins, whichever MEDS-Extract release parsed it.
-
-    MEDS-Extract 0.8 renamed ``_table.join`` to ``_table.joins`` and lets one table join several
-    targets, each its own left join applied in document order. 0.7 has at most one join per table.
-    Both come out of this as a (possibly empty) tuple of ``JoinConfig``s.
-
-    Args:
-        table: The parsed table config.
-
-    Returns:
-        The table's joins, in the order MEDS-Extract applies them.
-
-    Examples:
-        >>> from types import SimpleNamespace as NS
-        >>> table_joins(NS(joins=("to_stays", "to_admissions")))
-        ('to_stays', 'to_admissions')
-        >>> table_joins(NS(join="to_stays")), table_joins(NS(join=None))
-        (('to_stays',), ())
-    """
-    joins = getattr(table, "joins", None)
-    if joins is not None:
-        return tuple(joins)
-    join = getattr(table, "join", None)
-    return () if join is None else (join,)
 
 
 #: Expectation imposed by each MEDS output slot. Anything not listed (a passthrough column such as
@@ -244,7 +217,7 @@ def _infer_table(table: TableConfig, cs: ConstraintSet) -> None:
         table: The table config to walk.
         cs: The accumulator to write into.
     """
-    ctx = _Context(prefix=table.input_prefix, derived=dict(table.cols), joins=table_joins(table))
+    ctx = _Context(prefix=table.input_prefix, derived=dict(table.cols), joins=table.joins)
 
     if table.subject_id_node is not None:
         _visit(table.subject_id_node, ValueKind.SUBJECT_ID, ctx, cs, "subject_id")

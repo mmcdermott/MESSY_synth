@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 from dftly import Parser
 
 from .constraints import ColumnConstraint, ConstraintSet, ValueKind
-from .inference import infer_constraints, table_joins
+from .inference import infer_constraints
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from MEDS_extract.config import MessyConfig
@@ -478,7 +478,7 @@ def _link_joins(cfg: MessyConfig, uf: UnionFind) -> None:
         uf: The union-find to write into.
     """
     for table in cfg.event_tables:
-        for join in table_joins(table):
+        for join in table.joins:
             for left, right in zip(join.left_on, join.right_on, strict=True):
                 uf.union((table.input_prefix, left), (join.input_prefix, right))
 
@@ -517,10 +517,7 @@ def _link_identifiers_by_name(
         uf: The union-find to write into.
     """
     key_names = {
-        key
-        for table in cfg.event_tables
-        for join in table_joins(table)
-        for key in (*join.left_on, *join.right_on)
+        key for table in cfg.event_tables for join in table.joins for key in (*join.left_on, *join.right_on)
     }
     for prefix, columns in source_columns.items():
         for column in columns:
@@ -544,7 +541,7 @@ def _unique_key_columns(cfg: MessyConfig) -> set[tuple[str, str]]:
     """
     unique: set[tuple[str, str]] = set()
     for table in cfg.event_tables:
-        for join in table_joins(table):
+        for join in table.joins:
             if join.aggregations:
                 continue
             # One unique column is enough to make the whole tuple unique. Forcing every column would
@@ -566,7 +563,7 @@ def _covering_columns(cfg: MessyConfig, metadata: dict[str, _MetadataLayout]) ->
     """
     covering: set[tuple[str, str]] = set()
     for table in cfg.event_tables:
-        for join in table_joins(table):
+        for join in table.joins:
             for right in join.right_on:
                 covering.add((join.input_prefix, right))
     for prefix, layout in metadata.items():
