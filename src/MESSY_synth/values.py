@@ -394,18 +394,41 @@ def _pattern_values(patterns: tuple[str, ...], count: int, rng: Random, *, match
         ['24', '77']
         >>> _pattern_values(("^E",), 1, random.Random(1), match=False)
         ['NOMATCH000']
+
+        Several patterns must all hold, and the first need not be the most demanding. Taking the
+        k-th item of a comma-separated list (MC-MED's chief complaints) needs at least k commas, so
+        only values generated from the deepest pattern satisfy them all:
+
+        >>> nth_item = tuple(r"^(?:[^,]*,){%d} *([^,]*[^, ])" % k for k in range(8))
+        >>> values = _pattern_values(nth_item, 4, random.Random(0), match=True)
+        >>> len(values), all(re.search(p, v) for p in nth_item for v in values)
+        (4, True)
     """
     out: list[str] = []
-    for _ in range(count * 4):
-        if len(out) >= count:
+    # Candidates come from each pattern in turn until one yields a value that satisfies all of them,
+    # and from then on only from patterns that have: the most demanding pattern is usually the only
+    # one whose values satisfy the rest. A pattern the generator cannot model drops out instead of
+    # ending the search. With a single pattern this draws exactly what it always did.
+    heads = list(patterns)
+    proven: list[str] = []
+    turn = 0
+    for _ in range(count * 4 * len(patterns)):
+        candidates_from = proven or heads
+        if len(out) >= count or not candidates_from:
             break
-        head, *rest = patterns
+        head = candidates_from[turn % len(candidates_from)]
+        turn += 1
         candidate = generate_match(head, rng) if match else generate_non_match(head, rng)
         if candidate is None:
-            break
+            heads = [h for h in heads if h != head]
+            proven = [h for h in proven if h != head]
+            continue
         # Multiple patterns on one column must all hold at once.
-        ok = all(bool(re.search(p, candidate)) is match for p in rest)
-        if ok and candidate not in out:
+        if not all(bool(re.search(p, candidate)) is match for p in patterns if p != head):
+            continue
+        if head not in proven:
+            proven.append(head)
+        if candidate not in out:
             out.append(candidate)
     return out
 
