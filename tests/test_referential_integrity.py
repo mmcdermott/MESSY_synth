@@ -220,6 +220,42 @@ def test_hashed_subject_keys_are_shared_and_sized_by_subject_count():
     assert patients == labs
 
 
+@pytest.mark.parametrize("key", [3097, 0.00001])
+def test_numeric_metadata_key_stays_numeric_in_its_event_table(tmp_path, key):
+    """Metadata writes keys as text without corrupting numeric event-side keys."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "NumericMetadata", "raw_dataset_version": "1"},
+            "data_ref": {
+                "_defaults": {"subject_id": "$pid"},
+                "baseline": {
+                    "code": 'f"CASE_ATTR//{$FieldID}" if $FieldID == '
+                    + (str(key) if isinstance(key, int) else f"{key:f}"),
+                    "time": '$time::"%Y-%m-%d"',
+                    "_metadata": {
+                        "d_references": {
+                            "FieldID": "$ReferenceGlobalID",
+                            "description": "$ReferenceValue",
+                        }
+                    },
+                },
+            },
+        }
+    )
+
+    result = synthesize(cfg, tmp_path, n_subjects=40, null_fraction=0.0)
+
+    assert result.ok, [str(finding) for finding in result.findings]
+    assert result.fmt == "csv"
+    import polars as pl
+
+    events = result.dataset.frames["data_ref"]["FieldID"]
+    metadata = result.dataset.frames["d_references"]["ReferenceGlobalID"]
+    assert events.dtype.is_integer() if isinstance(key, int) else events.dtype.is_float()
+    assert key in events.to_list()
+    assert set(events.cast(pl.String)) <= set(metadata)
+
+
 def test_a_config_meds_extract_rejects_is_reported_not_raised(tmp_path):
     """A config that cannot be loaded produces a finding, not a traceback.
 
@@ -319,3 +355,39 @@ def test_a_death_role_does_not_empty_a_column_shared_with_an_ordinary_event(tmp_
     assert result.dataset.frames["adm"]["dischtime"].null_count() == 0
     yields = {row["event"]: row["rows_out"] for row in result.events.iter_rows(named=True)}
     assert yields["discharge"] == yields["admission"] == 20, yields
+
+
+def _numeric_key_cfg() -> MessyConfig:
+    """A numeric key compared against a literal and described by a metadata dictionary."""
+    return MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "NumericPool", "raw_dataset_version": "1"},
+            "data_ref": {
+                "_defaults": {"subject_id": "$pid"},
+                "baseline": {
+                    "code": 'f"CASE_ATTR//{$FieldID}" if $FieldID == 3097',
+                    "time": '$time::"%Y-%m-%d"',
+                    "_metadata": {
+                        "d_references": {"FieldID": "$ReferenceGlobalID", "description": "$ReferenceValue"}
+                    },
+                },
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [30, 60])
+def test_numeric_pool_members_are_distinct(vocab_size):
+    """A dictionary built from a numeric pool has one row per key, as a real dictionary does."""
+    dataset = generate(_numeric_key_cfg(), GenerationOptions(n_subjects=40, vocab_size=vocab_size))
+    keys = dataset.frames["d_references"]["ReferenceGlobalID"]
+    assert keys.n_unique() == keys.len() == vocab_size
+
+
+def test_numeric_pool_required_literals_survive_a_large_vocabulary():
+    """Compared-against literals keep a fixed row share however large the shared pool is."""
+    dataset = generate(
+        _numeric_key_cfg(), GenerationOptions(n_subjects=40, vocab_size=200, null_fraction=0.0)
+    )
+    field_ids = dataset.frames["data_ref"]["FieldID"]
+    assert (field_ids == 3097).mean() > 0.2

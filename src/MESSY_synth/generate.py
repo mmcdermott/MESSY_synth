@@ -36,7 +36,7 @@ from .plan import (
     SUBJECT_POOL,
     build_plan,
 )
-from .values import ValueFactory, build_timeline, categorical_pool, format_datetime
+from .values import ValueFactory, build_timeline, categorical_pool, format_datetimes
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from MEDS_extract.config import MessyConfig
@@ -48,6 +48,9 @@ logger = logging.getLogger(__name__)
 
 #: Share of rows in a numeric column that take one of the config's compared-against literals.
 REQUIRED_VALUE_SHARE = 0.35
+
+#: Draw attempts per wanted member when filling a numeric pool with distinct values.
+NUMERIC_POOL_DRAW_FACTOR = 20
 
 
 @dataclass(frozen=True)
@@ -303,9 +306,34 @@ def _materialize_pools(plan: DatasetPlan, options: GenerationOptions) -> dict[st
             continue
         # Name the pool after its first member column so tokens are self-describing.
         column = pool.members[0][1] if pool.members else pool_id
-        pools[pool_id] = categorical_pool(
-            column, pool.constraint, pool.size, random.Random(f"{options.seed}:pool:{pool_id}")
-        )
+        rng = random.Random(f"{options.seed}:pool:{pool_id}")
+        if pool.kind in (ValueKind.NUMERIC, ValueKind.INTEGER):
+            required = list(
+                dict.fromkeys(
+                    value
+                    for literal in pool.constraint.required_values
+                    if (value := _as_number(literal, pool.kind is ValueKind.INTEGER)) is not None
+                )
+            )
+            factory = ValueFactory(rng, numeric_ranges=options.numeric_ranges)
+            # Filler must be distinct: a repeated member becomes a duplicate dictionary key. A
+            # narrow range may hold fewer distinct numbers than the pool size; stop rather than
+            # loop forever, since every consumer indexes by the pool's actual length.
+            members = dict.fromkeys(required)
+            target = len(required) + max(1, pool.size - len(required))
+            for _ in range(target * NUMERIC_POOL_DRAW_FACTOR):
+                if len(members) >= target:
+                    break
+                members.setdefault(
+                    factory.numeric(
+                        column,
+                        integral=pool.kind is ValueKind.INTEGER,
+                        inferred_range=pool.constraint.numeric_range,
+                    )
+                )
+            pools[pool_id] = list(members)
+        else:
+            pools[pool_id] = categorical_pool(column, pool.constraint, pool.size, rng)
     return pools
 
 
@@ -397,7 +425,8 @@ def _generate_metadata_table(
 
     data: dict[str, list] = {}
     for i, column in enumerate(key_columns):
-        data[column.name] = [combo[i] for combo in combos]
+        # Match Polars' event-code stringification (Python spells some floats differently).
+        data[column.name] = pl.Series([combo[i] for combo in combos]).cast(pl.String).to_list()
     for column in other_columns:
         factory = ValueFactory(
             random.Random(f"{options.seed}:{table.prefix}:{column.name}"),
@@ -435,7 +464,6 @@ def _generate_column(
     Returns:
         The column's values.
     """
-    del plan
     rng = random.Random(f"{options.seed}:{table.prefix}:{column.name}")
     factory = ValueFactory(rng, null_fraction=options.null_fraction, numeric_ranges=options.numeric_ranges)
     constraint = column.constraint
@@ -463,7 +491,26 @@ def _generate_column(
             # Enumerate rather than sample: a key value missing from the target table would leave
             # every row referencing it unmatched.
             return [pool[i % len(pool)] for i in range(n_rows)]
-        return [factory.maybe_null(rng.choice(pool), constraint.nullable) for _ in range(n_rows)]
+        planned = plan.pools[column.pool_id]
+        required = []
+        if planned.kind in (ValueKind.NUMERIC, ValueKind.INTEGER):
+            integral = planned.kind is ValueKind.INTEGER
+            required = [
+                n
+                for n in (_as_number(v, integral) for v in planned.constraint.required_values)
+                if n is not None
+            ]
+        # As for unshared numeric columns below: a uniform draw from a large pool almost never
+        # lands on the literal a branch compares against, so required values get a fixed share.
+        return [
+            factory.maybe_null(
+                required[i % len(required)]
+                if required and rng.random() < REQUIRED_VALUE_SHARE
+                else rng.choice(pool),
+                constraint.nullable,
+            )
+            for i in range(n_rows)
+        ]
 
     if kind in (ValueKind.DATETIME, ValueKind.DATE, ValueKind.DATETIME_STR):
         return _generate_temporal(column, timelines, row_subjects, n_rows, factory, rng)
@@ -580,6 +627,8 @@ def _generate_temporal(
         if value is None:
             out.append(None)
             continue
-        rendered = format_datetime(value, constraint, i) if as_string else value
-        out.append(factory.maybe_null(rendered, constraint.effective_nullable))
+        out.append(factory.maybe_null(value, constraint.effective_nullable))
+    if as_string:
+        # Formatted for the whole column at once; null injection above does not depend on the value.
+        out = format_datetimes(out, constraint)
     return out

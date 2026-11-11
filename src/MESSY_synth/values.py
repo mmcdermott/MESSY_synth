@@ -30,6 +30,8 @@ from datetime import datetime, timedelta
 from random import Random
 from typing import TYPE_CHECKING
 
+import polars as pl
+
 from .regexgen import generate_match, generate_non_match
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -387,35 +389,44 @@ def _pattern_values(patterns: tuple[str, ...], count: int, rng: Random, *, match
     return out
 
 
-def format_datetime(value: datetime, constraint: ColumnConstraint, row_index: int) -> str:
-    """Render a timestamp using one of the column's recorded ``strptime`` formats.
+def format_datetimes(values: list[datetime | None], constraint: ColumnConstraint) -> list[str | None]:
+    """Render a column of timestamps using the column's recorded ``strptime`` formats.
 
     When a column carries several formats — the 0.7 idiom for mixed-format columns is
     ``coalesce($x::?"%Y-%m-%d %H:%M:%S", $x::?"%Y-%m-%d")`` — rows are distributed across all of
-    them, so every branch of the coalesce is exercised rather than just the first.
+    them, so every branch of the coalesce is exercised rather than just the first. Row ``i`` gets
+    format ``i % len(formats)``; each format renders its rows in one Polars call.
 
     Args:
-        value: The timestamp to render.
+        values: The timestamps to render, one per row; nulls stay null.
         constraint: The column's constraint, supplying the format list.
-        row_index: The row's position, used to rotate through the formats.
 
     Returns:
-        The rendered string.
+        The rendered strings.
 
     Examples:
         >>> dt = datetime(2015, 6, 1, 13, 45, 0)  # noqa: DTZ001
         >>> c = ColumnConstraint(datetime_formats=("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"))
-        >>> format_datetime(dt, c, 0)
-        '2015-06-01 13:45:00'
-        >>> format_datetime(dt, c, 1)
-        '2015-06-01'
+        >>> format_datetimes([dt, dt, None], c)
+        ['2015-06-01 13:45:00', '2015-06-01', None]
+        >>> fractional = datetime(2015, 6, 1, 13, 45, 0, 123456)  # noqa: DTZ001
+        >>> c = ColumnConstraint(datetime_formats=("%Y-%m-%d %H:%M:%S%.f",))
+        >>> format_datetimes([fractional], c)
+        ['2015-06-01 13:45:00.123456']
 
         With no recorded format, ISO-8601 is the fallback:
 
-        >>> format_datetime(dt, ColumnConstraint(), 0)
-        '2015-06-01T13:45:00'
+        >>> format_datetimes([dt], ColumnConstraint())
+        ['2015-06-01T13:45:00']
     """
     formats = constraint.datetime_formats
     if not formats:
-        return value.isoformat()
-    return value.strftime(formats[row_index % len(formats)])
+        return [None if v is None else v.isoformat() for v in values]
+    out: list[str | None] = [None] * len(values)
+    for k, fmt in enumerate(formats):
+        rows = range(k, len(values), len(formats))
+        # Use the ETL's own format language, including precision and escaped percent signs.
+        rendered = pl.Series([values[i] for i in rows], dtype=pl.Datetime("us")).dt.strftime(fmt)
+        for i, text in zip(rows, rendered, strict=True):
+            out[i] = text
+    return out
