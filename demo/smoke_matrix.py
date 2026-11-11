@@ -1,4 +1,4 @@
-"""Run the MESSY_synth smoke test across a set of MEDS-Extract v0.7 ETL configs.
+"""Run the MESSY_synth smoke test across a set of MEDS-Extract v0.8 ETL configs.
 
 This is the demonstration harness: point it at any number of MESSY files and it generates synthetic
 sources for each, runs the real ETL over them, and prints a pass/fail matrix. No credentials and no
@@ -6,7 +6,7 @@ real data are involved — every input is invented from the config itself.
 
 Usage::
 
-    uv run python demo/smoke_matrix.py NAME=path/to/messy.yaml [NAME=...] [--workdir DIR]
+    uv run python demo/smoke_matrix.py NAME=./path/to/messy.yaml [NAME=...] [--workdir DIR]
 
 Each argument is a ``label=path`` pair so the output table stays readable.
 """

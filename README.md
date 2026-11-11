@@ -32,11 +32,12 @@ That gets you two things:
 
 ## Install
 
-Not yet published to PyPI — install from source:
-
 ```bash
-uv add git+https://github.com/mmcdermott/MESSY_synth
+pip install MESSY_synth # or: uv add MESSY_synth
 ```
+
+MESSY_synth 0.1 reads MEDS-Extract 0.8 configs (`_table.joins`). For MEDS-Extract 0.7 configs, use
+`MESSY_synth==0.0.1`.
 
 Or for development:
 
@@ -51,12 +52,18 @@ uv run pre-commit install
 
 ```bash
 # Generate synthetic sources for an ETL, then look at what it inferred.
-MESSY-synth path/to/messy.yaml -o raw_synthetic/ --explain
+MESSY-synth ./path/to/messy.yaml -o raw_synthetic/ --explain
 
 # Run the real ETL over them.
-meds-extract-run spec=path/to/messy.yaml output_dir=meds_out/ \
+meds-extract-run spec=./path/to/messy.yaml output_dir=meds_out/ \
 	do_download=false input_dir=raw_synthetic/
 ```
+
+Give the config as `./path` or an absolute path: MEDS-Extract 0.8 reads a bare `path/to/messy.yaml`
+as the name of a registered pipeline. A registered name (`HIRID`) works too.
+
+If the spec has a pre-MEDS stage that converts the raw download into the tables the config reads
+(FHIR, OMOP), skip it with `'skip_stages=[<stage>]'`. MESSY_synth writes those tables directly.
 
 From Python, `synthesize` does the inference, generation, writing, and validation in one call:
 
@@ -225,6 +232,9 @@ MESSY-synth ./messy.yaml -o raw_synthetic/ \
 Other generators (prefixed strings, numbers) need the Python API. They are not a general
 row-context/RNG API.
 
+CDSL registers its split date and clock columns this way, and eICU its discharge year and clock. See
+their synthetic-ETL workflows.
+
 ## Smoke-testing an ETL
 
 `smoke_test` generates, runs `meds-extract-run`, and then checks the *artifacts* — not just the
@@ -237,34 +247,50 @@ from MESSY_synth import smoke_test
 
 
 def test_etl_still_works(tmp_path):
-    result = smoke_test("src/MY_MEDS/configs/messy.yaml", tmp_path)
+    result = smoke_test("./src/MY_MEDS/configs/messy.yaml", tmp_path)
     assert result.ok, result.summary()
 ```
 
 The CLI exits non-zero on any error finding, so it works directly in CI:
 
 ```bash
-MESSY-synth src/MY_MEDS/configs/messy.yaml -o "$RUNNER_TEMP/raw" || exit 1
+MESSY-synth ./src/MY_MEDS/configs/messy.yaml -o "$RUNNER_TEMP/raw" || exit 1
 ```
+
+`smoke_test` runs every stage of the spec. For a spec with a pre-MEDS stage, run the two quick-start
+commands with `skip_stages` instead.
 
 ## Validated against real ETLs
 
-`demo/smoke_matrix.py` runs the whole pipeline across a set of configs. Against the v0.7 ETL
-configs available at the time of writing:
+MESSY_synth 0.1.0 was checked against the MEDS-Extract 0.8 config of each ETL below, taken from the
+ETL's MEDS-Extract 0.8 branch where that hadn't merged yet (November 2026). For each one,
+`MESSY-synth` generated the raw files, and `meds-extract-run` built the full MEDS dataset from
+them, suMEDS enrichment stage included. Each ETL runs the same check in its own synthetic-ETL CI
+workflow.
 
-| ETL                  | Result                 | Output from synthetic input                                                                     |
-| -------------------- | ---------------------- | ----------------------------------------------------------------------------------------------- |
-| MEDS-Extract example | pass                   | 185 events, 16 subjects, 64 codes (40 described)                                                |
-| MIMIC-IV             | pass                   | 2,827 events, 40 subjects, 635 codes (312 described)                                            |
-| NWICU                | pass                   | 1,447 events, 40 subjects, 275 codes (130 described)                                            |
-| SICdb                | pass                   | 851 events, 40 subjects, 250 codes                                                              |
-| AmsterdamUMCdb       | pass                   | 1,294 events, 40 subjects, 711 codes                                                            |
-| HiRID                | **fails — config bug** | `raw_stage/observation_tables.datetime` is read both via `strptime` and directly as a timestamp |
-| INSPIRE              | **fails — config bug** | `operations` declares a self-join, which MEDS-Extract 0.7 rejects                               |
+| ETL                                                                      | Output from synthetic input           | Notes                                  |
+| ------------------------------------------------------------------------ | ------------------------------------- | -------------------------------------- |
+| [ALOTT](https://github.com/rvandewater/ALOTT_MEDS)                       | 3,474 events, 40 subjects, 445 codes  |                                        |
+| [AmsterdamUMCdb](https://github.com/prockenschaub/AUMCdb_MEDS)           | 1,667 events, 39 subjects, 846 codes  |                                        |
+| [CDSL](https://github.com/rvandewater/CDSL_MEDS)                         | 12,708 events, 40 subjects, 693 codes | 10 `--column-format` registrations     |
+| [FHIR](https://github.com/rvandewater/FHIR_MEDS)                         | 2,341 events, 40 subjects, 639 codes  | skips the `fhir_pre_meds` stage        |
+| [HiRID](https://github.com/rvandewater/HIRID_MEDS)                       | 486 events, 40 subjects, 28 codes     | join keys built from `_table.cols`     |
+| [INSPIRE](https://github.com/rvandewater/INSPIRE_MEDS)                   | 1,773 events, 40 subjects, 166 codes  |                                        |
+| [MC-MED](https://github.com/rvandewater/MC_MED_MEDS)                     | 2,327 events, 40 subjects, 455 codes  | several extract patterns on one column |
+| [MIMIC-IV](https://github.com/Medical-Event-Data-Standard/MIMIC_IV_MEDS) | 4,375 events, 40 subjects, 867 codes  |                                        |
+| [NWICU](https://github.com/rvandewater/NWICU_MEDS)                       | 2,811 events, 40 subjects, 465 codes  |                                        |
+| [OMOP](https://github.com/rvandewater/OMOP_MEDS)                         | 3,360 events, 40 subjects, 424 codes  | skips the `omop_pre_meds` stage        |
+| [PICdb](https://github.com/rvandewater/PICdb_MEDS)                       | 3,741 events, 40 subjects, 553 codes  |                                        |
+| [SICdb](https://github.com/rvandewater/SICdb_MEDS)                       | 1,688 events, 40 subjects, 260 codes  | numeric metadata keys                  |
+| [Zigong](https://github.com/rvandewater/Zigong_MEDS)                     | 10,640 events, 40 subjects, 400 codes |                                        |
 
-The last two are the tool working as intended. Neither config can run on *any* input, real or
-synthetic, and MESSY_synth reports each with the specific column or table at fault rather than a
-stack trace. eICU has no v0.7 MESSY config yet, so it is not represented.
+"Events" counts the rows of the MEDS data; "codes" counts the rows of `metadata/codes.parquet`. In
+AmsterdamUMCdb, one of the 40 generated subjects has no events left after extraction.
+
+[eICU](https://github.com/rvandewater/eICU_MEDS) is not in the table yet: its config is still on
+MEDS-Extract 0.7. With `joins:`, a `dataset_version` under `sources:`, and two registrations for its
+discharge year and clock, MESSY_synth generates data for it with no errors; the full ETL hasn't been
+run.
 
 ## Limitations
 
