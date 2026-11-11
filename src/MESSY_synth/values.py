@@ -356,6 +356,11 @@ def categorical_pool(column: str, constraint: ColumnConstraint, size: int, rng: 
         >>> matches = [v.startswith("E") for v in pool]
         >>> any(matches) and not all(matches)
         True
+
+        Extract patterns that cannot all hold leave the pool with a single token rather than empty:
+
+        >>> categorical_pool("x", ColumnConstraint(extract_patterns=("^a$", "^b$")), 2, random.Random(0))
+        ['SYNTH_X_000']
     """
     values: list[str] = list(dict.fromkeys(constraint.required_values))
     factory = ValueFactory(Random(0))
@@ -403,6 +408,25 @@ def _pattern_values(patterns: tuple[str, ...], count: int, rng: Random, *, match
         >>> values = _pattern_values(nth_item, 4, random.Random(0), match=True)
         >>> len(values), all(re.search(p, v) for p in nth_item for v in values)
         (4, True)
+
+        A pattern the generator cannot model (here a lookahead) drops out, and the others still
+        generate values, which must satisfy it too:
+
+        >>> _pattern_values((r"(?=\d)", r"^\d{2}$"), 2, random.Random(0), match=True)
+        ['60', '86']
+
+        Avoiding several patterns means avoiding all of them:
+
+        >>> _pattern_values(("^E", "^V"), 1, random.Random(0), match=False)
+        ['NOMATCH000']
+
+        Patterns that cannot be modelled, or cannot hold at once, give no values rather than wrong
+        ones:
+
+        >>> _pattern_values((r"(?=\d)", r"(?!a)"), 3, random.Random(0), match=True)
+        []
+        >>> _pattern_values(("^a$", "^b$"), 3, random.Random(0), match=True)
+        []
     """
     out: list[str] = []
     # Candidates come from each pattern in turn until one yields a value that satisfies all of them,
