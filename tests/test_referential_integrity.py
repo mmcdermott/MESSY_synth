@@ -12,7 +12,7 @@ import pytest
 from MEDS_extract.config import MessyConfig
 from MEDS_extract.io import resolve_source_files
 
-from MESSY_synth import GenerationOptions, generate, synthesize
+from MESSY_synth import GenerationOptions, generate, infer_constraints, synthesize
 from MESSY_synth.constraints import ValueKind
 
 #: A config exercising every structural feature the generator has to satisfy at once: a join to a
@@ -27,7 +27,7 @@ FEATURE_CONFIG = {
     "_defaults": {"subject_id": "$pid"},
     "hosp/patients": {
         "_table": {
-            "join": {"hosp/admissions": {"key": "pid", "cols": {"deathtime": "min"}}},
+            "joins": {"hosp/admissions": {"key": "pid", "cols": {"deathtime": "min"}}},
             "cols": {"final_dod": "$deathtime ?? $dod"},
         },
         "sex": {"code": 'f"SEX//{$sex}"', "time": None},
@@ -38,7 +38,7 @@ FEATURE_CONFIG = {
         "admit": {"code": 'f"ADMIT//{$admission_type}"', "time": '$admittime::"%Y-%m-%d %H:%M:%S"'},
     },
     "hosp/labs": {
-        "_table": {"join": {"hosp/stays": {"key": "stay_id", "cols": ["pid"]}}},
+        "_table": {"joins": {"hosp/stays": {"key": "stay_id", "cols": ["pid"]}}},
         "lab": {
             "code": 'f"LAB//{$itemid}//{$uom}"',
             "time": '$charttime::"%Y-%m-%d %H:%M:%S"',
@@ -91,13 +91,44 @@ def test_join_keys_resolve_on_the_far_side(features_cfg):
     """No join key dangles: MEDS-Extract left joins would silently drop those rows."""
     dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
     for table in features_cfg.event_tables:
-        if table.join is None:
-            continue
-        left = dataset.frames[table.input_prefix]
-        right = dataset.frames[table.join.input_prefix]
-        for lkey, rkey in zip(table.join.left_on, table.join.right_on, strict=True):
-            missing = set(left[lkey].drop_nulls().to_list()) - set(right[rkey].drop_nulls().to_list())
-            assert not missing, f"{table.input_prefix}.{lkey} -> {table.join.input_prefix}.{rkey}"
+        for join in table.joins:
+            left = dataset.frames[table.input_prefix]
+            right = dataset.frames[join.input_prefix]
+            for lkey, rkey in zip(join.left_on, join.right_on, strict=True):
+                missing = set(left[lkey].drop_nulls().to_list()) - set(right[rkey].drop_nulls().to_list())
+                assert not missing, f"{table.input_prefix}.{lkey} -> {join.input_prefix}.{rkey}"
+
+
+def test_a_table_joining_two_targets_resolves_both(tmp_path):
+    """MEDS-Extract 0.8 lets one table join several targets; every one of them must resolve."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "MultiJoin", "raw_dataset_version": "1"},
+            "stays": {"_defaults": {"subject_id": "$pid"}, "s": {"code": "STAY", "time": None}},
+            "admissions": {"_defaults": {"subject_id": "$pid"}, "a": {"code": "ADM", "time": None}},
+            "labs": {
+                "_defaults": {"subject_id": "$pid"},
+                "_table": {
+                    "joins": {
+                        "stays": {"key": "stay_id", "cols": ["unit"]},
+                        "admissions": {"key": "hadm_id", "cols": ["dischtime"]},
+                    },
+                },
+                "lab": {"code": 'f"LAB//{$unit}"', "time": '$dischtime::"%Y-%m-%d %H:%M:%S"'},
+            },
+        }
+    )
+    labs = next(t for t in cfg.event_tables if t.input_prefix == "labs")
+    assert [j.input_prefix for j in labs.joins] == ["stays", "admissions"]
+
+    dataset = generate(cfg, GenerationOptions(seed=0, n_subjects=16))
+    left = dataset.frames["labs"]
+    for target, key in (("stays", "stay_id"), ("admissions", "hadm_id")):
+        right = set(dataset.frames[target][key].drop_nulls().to_list())
+        assert set(left[key].drop_nulls().to_list()) <= right, target
+
+    result = synthesize(cfg, tmp_path, n_subjects=16, seed=0)
+    assert result.ok, [str(f) for f in result.findings]
 
 
 def test_metadata_dictionary_covers_the_event_vocabulary(features_cfg):
@@ -130,6 +161,16 @@ def test_a_different_seed_changes_the_data(features_cfg):
     a = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
     b = generate(features_cfg, GenerationOptions(seed=2, n_subjects=16))
     assert not a.frames["hosp/labs"].equals(b.frames["hosp/labs"])
+
+
+@pytest.mark.parametrize(
+    "key",
+    [("hosp/labs", "itemid"), ("hosp/labs", "stay_id"), ("hosp/d_labitems", "label")],
+)
+def test_generators_cannot_bypass_shared_keys_or_metadata(features_cfg, key):
+    """Independent callbacks must not bypass the planner's cross-file invariants."""
+    with pytest.raises(ValueError, match=r"shared source relationship|targets metadata"):
+        generate(features_cfg, GenerationOptions(column_generators={key: lambda value: "override"}))
 
 
 def test_written_files_resolve_through_meds_extracts_own_resolver(features_cfg, tmp_path):
@@ -220,6 +261,93 @@ def test_hashed_subject_keys_are_shared_and_sized_by_subject_count():
     assert patients == labs
 
 
+@pytest.mark.parametrize("key", [3097, 0.00001])
+def test_numeric_metadata_key_stays_numeric_in_its_event_table(tmp_path, key):
+    """Metadata writes keys as text without corrupting numeric event-side keys."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "NumericMetadata", "raw_dataset_version": "1"},
+            "data_ref": {
+                "_defaults": {"subject_id": "$pid"},
+                "baseline": {
+                    "code": 'f"CASE_ATTR//{$FieldID}" if $FieldID == '
+                    + (str(key) if isinstance(key, int) else f"{key:f}"),
+                    "time": '$time::"%Y-%m-%d"',
+                    "_metadata": {
+                        "d_references": {
+                            "FieldID": "$ReferenceGlobalID",
+                            "description": "$ReferenceValue",
+                        }
+                    },
+                },
+            },
+        }
+    )
+
+    result = synthesize(cfg, tmp_path, n_subjects=40, null_fraction=0.0)
+
+    assert result.ok, [str(finding) for finding in result.findings]
+    assert result.fmt == "csv"
+    import polars as pl
+
+    events = result.dataset.frames["data_ref"]["FieldID"]
+    metadata = result.dataset.frames["d_references"]["ReferenceGlobalID"]
+    assert events.dtype.is_integer() if isinstance(key, int) else events.dtype.is_float()
+    assert key in events.to_list()
+    assert set(events.cast(pl.String)) <= set(metadata)
+
+
+def test_registered_generators_render_interpolated_timestamp_components(tmp_path):
+    """F-string components stay opaque unless the caller explicitly supplies their renderers."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "SplitTimestamp", "raw_dataset_version": "1"},
+            "visits": {
+                "_defaults": {"subject_id": "$pid"},
+                "visit": {
+                    "code": "VISIT",
+                    "time": 'f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"',
+                },
+            },
+        }
+    )
+
+    constraints = infer_constraints(cfg)
+    assert constraints.get("visits", "date").datetime_formats == ()
+    assert constraints.get("visits", "clock").datetime_formats == ()
+
+    result = synthesize(
+        cfg,
+        tmp_path,
+        n_subjects=40,
+        null_fraction=0.0,
+        column_generators={
+            ("visits", "date"): lambda instant: instant.strftime("%Y-%m-%d"),
+            ("visits", "clock"): lambda instant: instant.strftime("%H:%M:%S"),
+        },
+    )
+
+    assert result.ok, [str(finding) for finding in result.findings]
+    assert result.events is not None
+    assert result.events["rows_out"].min() > 0
+
+
+def test_registered_generator_must_name_a_source_column():
+    """Typos in a generator registration fail before an unrelated table is written."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "Registered", "raw_dataset_version": "1"},
+            "t": {"_defaults": {"subject_id": "$pid"}, "e": {"code": "X", "time": None}},
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"unknown source column \('t', 'missing'\)"):
+        generate(
+            cfg,
+            GenerationOptions(column_generators={("t", "missing"): lambda instant: "value"}),
+        )
+
+
 def test_a_config_meds_extract_rejects_is_reported_not_raised(tmp_path):
     """A config that cannot be loaded produces a finding, not a traceback.
 
@@ -240,7 +368,7 @@ def test_a_config_meds_extract_rejects_is_reported_not_raised(tmp_path):
                 "etl": {"dataset_name": "Broken", "raw_dataset_version": "1"},
                 "ops": {
                     "_defaults": {"subject_id": "$pid"},
-                    "_table": {"join": {"ops": {"key": "pid", "cols": {"age": "min"}}}},
+                    "_table": {"joins": {"ops": {"key": "pid", "cols": {"age": "min"}}}},
                     "e": {"code": "X", "time": None},
                 },
             }
@@ -263,7 +391,7 @@ FANOUT_CONFIG = {
         "admit": {"code": "ADMIT", "time": '$admittime::"%Y-%m-%d"'},
     },
     "diagnoses": {
-        "_table": {"join": {"admissions": {"key": "hadm_id", "cols": ["dischtime"]}}},
+        "_table": {"joins": {"admissions": {"key": "hadm_id", "cols": ["dischtime"]}}},
         "dx": {"code": 'f"DX//{$icd}"', "time": '$dischtime::"%Y-%m-%d"'},
     },
 }
@@ -319,3 +447,39 @@ def test_a_death_role_does_not_empty_a_column_shared_with_an_ordinary_event(tmp_
     assert result.dataset.frames["adm"]["dischtime"].null_count() == 0
     yields = {row["event"]: row["rows_out"] for row in result.events.iter_rows(named=True)}
     assert yields["discharge"] == yields["admission"] == 20, yields
+
+
+def _numeric_key_cfg() -> MessyConfig:
+    """A numeric key compared against a literal and described by a metadata dictionary."""
+    return MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "NumericPool", "raw_dataset_version": "1"},
+            "data_ref": {
+                "_defaults": {"subject_id": "$pid"},
+                "baseline": {
+                    "code": 'f"CASE_ATTR//{$FieldID}" if $FieldID == 3097',
+                    "time": '$time::"%Y-%m-%d"',
+                    "_metadata": {
+                        "d_references": {"FieldID": "$ReferenceGlobalID", "description": "$ReferenceValue"}
+                    },
+                },
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [30, 60])
+def test_numeric_pool_members_are_distinct(vocab_size):
+    """A dictionary built from a numeric pool has one row per key, as a real dictionary does."""
+    dataset = generate(_numeric_key_cfg(), GenerationOptions(n_subjects=40, vocab_size=vocab_size))
+    keys = dataset.frames["d_references"]["ReferenceGlobalID"]
+    assert keys.n_unique() == keys.len() == vocab_size
+
+
+def test_numeric_pool_required_literals_survive_a_large_vocabulary():
+    """Compared-against literals keep a fixed row share however large the shared pool is."""
+    dataset = generate(
+        _numeric_key_cfg(), GenerationOptions(n_subjects=40, vocab_size=200, null_fraction=0.0)
+    )
+    field_ids = dataset.frames["data_ref"]["FieldID"]
+    assert (field_ids == 3097).mean() > 0.2

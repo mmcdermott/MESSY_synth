@@ -247,7 +247,7 @@ def build_plan(
         ...     "_defaults": {"subject_id": "$patient_id"},
         ...     "patients": {"sex": {"code": 'f"SEX//{$sex}"', "time": None}},
         ...     "labs": {
-        ...         "_table": {"join": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
+        ...         "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["patient_id"]}}},
         ...         "lab": {"code": "$test", "time": '$t::"%Y-%m-%d"', "numeric_value": "$val"},
         ...     },
         ... })
@@ -478,10 +478,9 @@ def _link_joins(cfg: MessyConfig, uf: UnionFind) -> None:
         uf: The union-find to write into.
     """
     for table in cfg.event_tables:
-        if table.join is None:
-            continue
-        for left, right in zip(table.join.left_on, table.join.right_on, strict=True):
-            uf.union((table.input_prefix, left), (table.join.input_prefix, right))
+        for join in table.joins:
+            for left, right in zip(join.left_on, join.right_on, strict=True):
+                uf.union((table.input_prefix, left), (join.input_prefix, right))
 
 
 def _link_metadata(metadata: dict[str, _MetadataLayout], uf: UnionFind) -> None:
@@ -518,10 +517,7 @@ def _link_identifiers_by_name(
         uf: The union-find to write into.
     """
     key_names = {
-        key
-        for table in cfg.event_tables
-        if table.join is not None
-        for key in (*table.join.left_on, *table.join.right_on)
+        key for table in cfg.event_tables for join in table.joins for key in (*join.left_on, *join.right_on)
     }
     for prefix, columns in source_columns.items():
         for column in columns:
@@ -545,13 +541,13 @@ def _unique_key_columns(cfg: MessyConfig) -> set[tuple[str, str]]:
     """
     unique: set[tuple[str, str]] = set()
     for table in cfg.event_tables:
-        join = table.join
-        if join is None or join.aggregations:
-            continue
-        # One unique column is enough to make the whole tuple unique. Forcing every column would
-        # break the canonical composite idiom, where a second key is a literal used to *filter* the
-        # target (`cols: {drug_type: "'MAIN'"}`) and must therefore repeat.
-        unique.add((join.input_prefix, join.right_on[0]))
+        for join in table.joins:
+            if join.aggregations:
+                continue
+            # One unique column is enough to make the whole tuple unique. Forcing every column would
+            # break the canonical composite idiom, where a second key is a literal used to *filter*
+            # the target (`cols: {drug_type: "'MAIN'"}`) and must therefore repeat.
+            unique.add((join.input_prefix, join.right_on[0]))
     return unique
 
 
@@ -567,9 +563,9 @@ def _covering_columns(cfg: MessyConfig, metadata: dict[str, _MetadataLayout]) ->
     """
     covering: set[tuple[str, str]] = set()
     for table in cfg.event_tables:
-        if table.join is not None:
-            for right in table.join.right_on:
-                covering.add((table.join.input_prefix, right))
+        for join in table.joins:
+            for right in join.right_on:
+                covering.add((join.input_prefix, right))
     for prefix, layout in metadata.items():
         for meta_col in layout.key_source_columns:
             covering.add((prefix, meta_col))

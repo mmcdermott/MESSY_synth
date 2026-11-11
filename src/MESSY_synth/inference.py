@@ -1,6 +1,6 @@
 """Infer a synthetic source schema by walking the dftly expressions in a MESSY config.
 
-A MEDS-Extract v0.7 MESSY config describes an ETL as expressions *over* raw source columns. It
+A MEDS-Extract v0.8 MESSY config describes an ETL as expressions *over* raw source columns. It
 never declares those columns' types — the raw files are supposed to already exist. To synthesize
 inputs we have to run that reasoning backwards: read the expressions, and deduce what the files
 must have contained for the expressions to make sense.
@@ -15,7 +15,7 @@ Column references are not always leaves. Three cases are resolved during the wal
 
 - a name declared in ``_table.cols`` is *derived*, so the walk recurses into its defining
   expression, carrying the expectation through to the raw columns underneath;
-- a name pulled in by ``_table.join`` belongs to the **join target's** file, so the constraint is
+- a name pulled in by ``_table.joins`` belongs to the **join target's** file, so the constraint is
   recorded against that other table;
 - anything else is a real column of this table's own file.
 
@@ -56,6 +56,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from MEDS_extract.config import MessyConfig, TableConfig
 
 logger = logging.getLogger(__name__)
+
 
 #: Expectation imposed by each MEDS output slot. Anything not listed (a passthrough column such as
 #: ``hadm_id``) carries no expectation and falls through to the default string treatment.
@@ -165,7 +166,7 @@ def infer_constraints(cfg: MessyConfig) -> ConstraintSet:
         >>> cfg = MessyConfig.parse({
         ...     "labs": {
         ...         "_defaults": {"subject_id": "$patient_id"},
-        ...         "_table": {"join": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
+        ...         "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["dischtime"]}}},
         ...         "lab": {"code": "$test", "time": '$dischtime::"%Y-%m-%d"'},
         ...     },
         ... })
@@ -216,7 +217,7 @@ def _infer_table(table: TableConfig, cs: ConstraintSet) -> None:
         table: The table config to walk.
         cs: The accumulator to write into.
     """
-    ctx = _Context(prefix=table.input_prefix, derived=dict(table.cols), join=table.join)
+    ctx = _Context(prefix=table.input_prefix, derived=dict(table.cols), joins=table.joins)
 
     if table.subject_id_node is not None:
         _visit(table.subject_id_node, ValueKind.SUBJECT_ID, ctx, cs, "subject_id")
@@ -227,23 +228,21 @@ def _infer_table(table: TableConfig, cs: ConstraintSet) -> None:
             ColumnConstraint(kind=ValueKind.SUBJECT_ID, nullable=False).with_note("implicit subject_id"),
         )
 
-    if table.join is not None:
-        key_constraint = ColumnConstraint(kind=ValueKind.IDENTIFIER, nullable=False)
-        for left, right in zip(table.join.left_on, table.join.right_on, strict=True):
+    key_constraint = ColumnConstraint(kind=ValueKind.IDENTIFIER, nullable=False)
+    for join in ctx.joins:
+        for left, right in zip(join.left_on, join.right_on, strict=True):
             # A left key may itself be a `_table.cols` literal used to filter the right side (the
             # canonical `drug_type: "'MAIN'"` idiom); those are derived, not read, so route the
             # observation through the normal resolver rather than asserting a source column.
             if left in ctx.derived:
-                _visit(
-                    ctx.derived[left], ValueKind.IDENTIFIER, ctx, cs, f"join key -> {table.join.input_prefix}"
-                )
+                _visit(ctx.derived[left], ValueKind.IDENTIFIER, ctx, cs, f"join key -> {join.input_prefix}")
                 # The canonical composite idiom restricts a join with a literal key
                 # (`cols: {drug_type: "'MAIN'"}`). That literal has to occur on the target side or
                 # the join matches nothing at all.
                 literal = _literal_value(ctx.derived[left])
                 if literal is not None:
                     cs.observe(
-                        table.join.input_prefix,
+                        join.input_prefix,
                         right,
                         ColumnConstraint(required_values=(str(literal),)).with_note(
                             f"filtered to {literal!r} by {table.input_prefix}"
@@ -253,18 +252,18 @@ def _infer_table(table: TableConfig, cs: ConstraintSet) -> None:
                 cs.observe(
                     table.input_prefix,
                     left,
-                    key_constraint.with_note(f"join key -> {table.join.input_prefix}"),
+                    key_constraint.with_note(f"join key -> {join.input_prefix}"),
                 )
             cs.observe(
-                table.join.input_prefix,
+                join.input_prefix,
                 right,
                 key_constraint.with_note(f"join key <- {table.input_prefix}"),
             )
         # Aggregated joins (`cols: {deathtime: min}`) reduce the named column, so it must be
         # orderable; min/max over strings works in polars, so no numeric constraint is forced.
-        for col, agg in table.join.aggregations:
+        for col, agg in join.aggregations:
             cs.observe(
-                table.join.input_prefix,
+                join.input_prefix,
                 col,
                 ColumnConstraint().with_note(f"aggregated with {agg}() for {table.input_prefix}"),
             )
@@ -299,6 +298,71 @@ def _infer_table(table: TableConfig, cs: ConstraintSet) -> None:
                 )
 
 
+def event_column_references(cfg: MessyConfig, by_slot: bool = False) -> dict[tuple[str, str], object]:
+    """Map each event to the raw source columns its expressions read.
+
+    ``_table.cols`` names are expanded to the columns they are computed from, and joined columns
+    are attributed to the join target's file, as in :func:`infer_constraints`.
+
+    Args:
+        cfg: A parsed MESSY config.
+        by_slot: Whether to break each event's references down by output slot.
+
+    Returns:
+        ``(table_prefix, event_name)`` mapped to a set of ``(source_prefix, column)``, or with
+        ``by_slot``, to a mapping of slot name to such a set.
+
+    Examples:
+        >>> from MEDS_extract.config import MessyConfig
+        >>> cfg = MessyConfig.parse({
+        ...     "labs": {
+        ...         "_defaults": {"subject_id": "$pid"},
+        ...         "_table": {"cols": {"_t": 'f"{$date} {$clock}"::?"%Y-%m-%d %H:%M"'}},
+        ...         "lab": {"code": "LAB", "time": "$_t", "numeric_value": "$value"},
+        ...     },
+        ... })
+        >>> sorted(event_column_references(cfg)[("labs", "lab")])
+        [('labs', 'clock'), ('labs', 'date'), ('labs', 'value')]
+        >>> event_column_references(cfg, by_slot=True)[("labs", "lab")]["numeric_value"]
+        {('labs', 'value')}
+    """
+    out: dict[tuple[str, str], object] = {}
+    for table in cfg.event_tables:
+        ctx = _Context(prefix=table.input_prefix, derived=dict(table.cols), joins=table.joins)
+        for event in table.events:
+            slots: dict[str, set[tuple[str, str]]] = {}
+            for slot, node in event.columns.items():
+                slots[slot] = set()
+                _collect_columns(node, ctx, slots[slot], frozenset())
+            key = (table.input_prefix, event.name)
+            out[key] = slots if by_slot else set().union(*slots.values())
+    return out
+
+
+def _collect_columns(node: object, ctx: _Context, refs: set[tuple[str, str]], seen: frozenset[str]) -> None:
+    """Add every raw column reference beneath ``node`` to ``refs``.
+
+    Args:
+        node: The node (or nested container of nodes) to walk.
+        ctx: The resolving context.
+        refs: The accumulator.
+        seen: Derived names already being expanded, for cycle safety.
+    """
+    if isinstance(node, Column):
+        name = node.args[0]
+        if name in ctx.derived:
+            if name not in seen:
+                _collect_columns(ctx.derived[name], ctx, refs, seen | {name})
+            return
+        refs.add((ctx.owner_of(name), name))
+    elif isinstance(node, NodeBase):
+        _collect_columns(node.args, ctx, refs, seen)
+        _collect_columns(list(node.kwargs.values()), ctx, refs, seen)
+    elif isinstance(node, list | tuple):
+        for item in node:
+            _collect_columns(item, ctx, refs, seen)
+
+
 def _infer_metadata(cfg: MessyConfig, cs: ConstraintSet) -> None:
     """Collect constraints for every ``_metadata`` dictionary file.
 
@@ -317,7 +381,7 @@ def _infer_metadata(cfg: MessyConfig, cs: ConstraintSet) -> None:
                 node = _parse(expr)
                 if node is None:
                     continue
-                ctx = _Context(prefix=prefix, derived={}, join=None)
+                ctx = _Context(prefix=prefix, derived={}, joins=())
                 _visit(node, ValueKind.CATEGORICAL, ctx, cs, f"_metadata[{prefix}].{out_name}")
 
 
@@ -355,15 +419,15 @@ class _Context:
     Attributes:
         prefix: The source prefix that unqualified column references belong to.
         derived: ``_table.cols`` entries, which are computed rather than read.
-        join: This table's join, if any — its ``cols`` name the columns that live on the far side.
+        joins: This table's joins — their ``cols`` name the columns that live on the far side.
     """
 
-    __slots__ = ("derived", "join", "prefix")
+    __slots__ = ("derived", "joins", "prefix")
 
-    def __init__(self, prefix: str, derived: dict[str, NodeBase], join: object) -> None:
+    def __init__(self, prefix: str, derived: dict[str, NodeBase], joins: tuple) -> None:
         self.prefix = prefix
         self.derived = derived
-        self.join = join
+        self.joins = joins
 
     def owner_of(self, column: str) -> str:
         """Return the source prefix that ``column`` is read from.
@@ -372,10 +436,11 @@ class _Context:
             column: The referenced column name.
 
         Returns:
-            The join target's prefix if the column is pulled through the join, else this table's.
+            The prefix of the join target that delivers the column, else this table's.
         """
-        if self.join is not None and column in self.join.cols:
-            return self.join.input_prefix
+        for join in self.joins:
+            if column in join.cols:
+                return join.input_prefix
         return self.prefix
 
 

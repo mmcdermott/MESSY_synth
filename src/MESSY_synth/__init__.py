@@ -1,4 +1,4 @@
-"""Generate structurally-faithful synthetic raw data from any MEDS-Extract v0.7 MESSY config.
+"""Generate structurally-faithful synthetic raw data from any MEDS-Extract v0.8 MESSY config.
 
 A MESSY config is a complete, config-only ETL: it says where the raw data comes from, and how to
 turn each raw table into MEDS events, using the `dftly <https://github.com/mmcdermott/dftly>`_
@@ -22,17 +22,19 @@ Typical use::
 """
 
 from .constraints import ColumnConstraint, ConstraintSet, ValueKind
-from .generate import GeneratedDataset, GenerationOptions, generate
+from .generate import ColumnGenerator, GeneratedDataset, GenerationOptions, generate
 from .inference import infer_constraints
 from .plan import ColumnPlan, DatasetPlan, TablePlan, ValuePool, build_plan
 from .smoke import SmokeResult, check_output, run_etl, smoke_test
 from .synth import SynthesisResult, synthesize
 from .validate import Finding, check_plan, dry_run, recommended_n_subjects
+from .values import chrono_formatter
 from .writer import FORMATS, write_dataset
 
 __all__ = [
     "FORMATS",
     "ColumnConstraint",
+    "ColumnGenerator",
     "ColumnPlan",
     "ConstraintSet",
     "DatasetPlan",
@@ -47,6 +49,7 @@ __all__ = [
     "build_plan",
     "check_output",
     "check_plan",
+    "chrono_formatter",
     "dry_run",
     "generate",
     "infer_constraints",

@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MESSY_synth#license)
 
 **Generate synthetic raw data that matches the shape a [MEDS-Extract](https://github.com/mmcdermott/MEDS_extract)
-v0.7 MESSY config expects — then run the whole ETL over it, with no access to the real dataset.**
+v0.8 MESSY config expects — then run the whole ETL over it, with no access to the real dataset.**
 
 A MESSY file is a complete, config-only ETL. It declares where the raw data comes from and how each
 raw table becomes MEDS events, written in the [dftly](https://github.com/mmcdermott/dftly)
@@ -134,7 +134,7 @@ that must agree, and each group gets a single shared value pool.
 Expectations flow *down* the dftly AST from each MEDS output slot — `time` must yield a timestamp,
 `numeric_value` a number, `code` a string — and each node says how its own expectation constrains
 its children. Column references are not always leaves: a `_table.cols` name is expanded in place,
-and a name pulled in by `_table.join` is attributed to the table it actually lives in.
+and a name pulled in by `_table.joins` is attributed to the table it actually lives in.
 
 ```python
 >>> from MESSY_synth import infer_constraints
@@ -168,6 +168,62 @@ Some of what it deduces is less obvious than a dtype:
     the subject's timeline rather than sampled.
 
 `--explain` prints all of it, per column, with the reasoning attached.
+
+## Explicit column generators
+
+For representations the config cannot express, register a generator. For example, a timestamp
+assembled from a date and a clock column constrains only the assembled string, so neither column's
+own format is inferred:
+
+```python
+>>> from MESSY_synth import chrono_formatter
+>>> split_cfg = MessyConfig.parse({
+...     "etl": {"dataset_name": "SplitTime", "raw_dataset_version": "1"},
+...     "visits": {
+...         "_defaults": {"subject_id": "$pid"},
+...         "visit": {"code": "VISIT", "time": 'f"{$date[0:10]} {$clock}"::?"%Y-%m-%d %H:%M:%S"'},
+...     },
+... })
+>>> generators = {
+...     ("visits", "date"): chrono_formatter("%Y-%m-%d"),
+...     ("visits", "clock"): chrono_formatter("%H:%M:%S"),
+... }
+>>> with tempfile.TemporaryDirectory() as d:
+...     result = synthesize(split_cfg, d, column_generators=generators)
+...     result.ok
+True
+
+```
+
+- Keys name raw `(table_prefix, column)` pairs, including full nested prefixes, not derived names.
+- Each callable receives a naive synthetic `datetime` and returns one value. Registered ordinary
+    columns in a table share an instant per row, so date/time fragments agree; direct birth/death
+    roles retain the existing timeline handling. Callables must be deterministic for reproducibility.
+- `chrono_formatter` uses Polars' Chrono formatting, the same format language as the ETL parser,
+    including `%.f`, `%.3f`, `%.6f`, `%.9f`, and escaped `%%`. No Python directive translation is needed.
+- Unknown columns, non-callables, metadata columns, and protected shared/subject/join keys are
+    rejected rather than silently breaking relationships. Overrides do not change inferred constraints.
+- Default validation evaluates the generated files through MESSY, including value expressions.
+    Errors and events with no surviving rows fail validation. This is a check of the generated sample,
+    **not proof of every possible callback output or complete branch coverage**. Lenient casts can still
+    produce nulls in some rows. `generate()` alone and `synthesize(validate=False)` do not run this check.
+- Each registration gets a verdict finding named `prefix:column`: `info` "registration matches the
+    config: accepted by ..." when every event reading the column evaluates and keeps rows, or `error`
+    "registration does not match the config: ..." naming the events that rejected it. A failing event only counts against a registration when the output slot that fails
+    (`time`, `numeric_value`, ...) reads the column.
+
+Use the same `column_generators` argument with `smoke_test()` for a full ETL run. From the CLI,
+register Chrono formats with the repeatable `--column-format PREFIX/COL=FMT` option. The column is
+the text after the last `/`, so nested prefixes work:
+
+```bash
+MESSY-synth ./messy.yaml -o raw_synthetic/ \
+	--column-format visits/date=%Y-%m-%d \
+	--column-format visits/clock=%H:%M:%S
+```
+
+Other generators (prefixed strings, numbers) need the Python API. They are not a general
+row-context/RNG API.
 
 ## Smoke-testing an ETL
 
