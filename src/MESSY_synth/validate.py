@@ -189,7 +189,7 @@ def check_plan(cfg: MessyConfig, plan: DatasetPlan, fmt: str = "csv") -> list[Fi
         ...     "obs": {"_defaults": {"subject_id": "$pid"},
         ...             "e": {"code": "X", "time": '$ts::"%Y-%m-%d"'}},
         ...     "gen": {"_defaults": {"subject_id": "$pid"},
-        ...             "_table": {"join": {"obs": {"key": "pid", "cols": {"ts": "max"}}}},
+        ...             "_table": {"joins": {"obs": {"key": "pid", "cols": {"ts": "max"}}}},
         ...             "d": {"code": "Y", "time": "$ts"}},
         ... })
         >>> print(check_plan(conflicted, build_plan(conflicted, n_subjects=40))[0])

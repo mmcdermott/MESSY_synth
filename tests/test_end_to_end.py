@@ -33,7 +33,7 @@ E2E_CONFIG = {
         "dod": {"code": "MEDS_DEATH", "time": '$dod::?"%Y-%m-%d %H:%M:%S"'},
     },
     "labs": {
-        "_table": {"join": {"stays": {"key": "stay_id", "cols": ["pid"]}}},
+        "_table": {"joins": {"stays": {"key": "stay_id", "cols": ["pid"]}}},
         "lab": {
             "code": "f\"LAB//{$itemid ?? 'UNK'}//{$uom ?? 'UNK'}\"",
             "time": '$charttime::"%Y-%m-%d %H:%M:%S"',

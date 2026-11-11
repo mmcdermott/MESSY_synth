@@ -14,6 +14,7 @@ from MEDS_extract.io import resolve_source_files
 
 from MESSY_synth import GenerationOptions, generate, synthesize
 from MESSY_synth.constraints import ValueKind
+from MESSY_synth.inference import table_joins
 
 #: A config exercising every structural feature the generator has to satisfy at once: a join to a
 #: dimension table, an aggregated join, derived `_table.cols`, nested prefixes, a metadata
@@ -27,7 +28,7 @@ FEATURE_CONFIG = {
     "_defaults": {"subject_id": "$pid"},
     "hosp/patients": {
         "_table": {
-            "join": {"hosp/admissions": {"key": "pid", "cols": {"deathtime": "min"}}},
+            "joins": {"hosp/admissions": {"key": "pid", "cols": {"deathtime": "min"}}},
             "cols": {"final_dod": "$deathtime ?? $dod"},
         },
         "sex": {"code": 'f"SEX//{$sex}"', "time": None},
@@ -38,7 +39,7 @@ FEATURE_CONFIG = {
         "admit": {"code": 'f"ADMIT//{$admission_type}"', "time": '$admittime::"%Y-%m-%d %H:%M:%S"'},
     },
     "hosp/labs": {
-        "_table": {"join": {"hosp/stays": {"key": "stay_id", "cols": ["pid"]}}},
+        "_table": {"joins": {"hosp/stays": {"key": "stay_id", "cols": ["pid"]}}},
         "lab": {
             "code": 'f"LAB//{$itemid}//{$uom}"',
             "time": '$charttime::"%Y-%m-%d %H:%M:%S"',
@@ -91,13 +92,44 @@ def test_join_keys_resolve_on_the_far_side(features_cfg):
     """No join key dangles: MEDS-Extract left joins would silently drop those rows."""
     dataset = generate(features_cfg, GenerationOptions(seed=1, n_subjects=16))
     for table in features_cfg.event_tables:
-        if table.join is None:
-            continue
-        left = dataset.frames[table.input_prefix]
-        right = dataset.frames[table.join.input_prefix]
-        for lkey, rkey in zip(table.join.left_on, table.join.right_on, strict=True):
-            missing = set(left[lkey].drop_nulls().to_list()) - set(right[rkey].drop_nulls().to_list())
-            assert not missing, f"{table.input_prefix}.{lkey} -> {table.join.input_prefix}.{rkey}"
+        for join in table_joins(table):
+            left = dataset.frames[table.input_prefix]
+            right = dataset.frames[join.input_prefix]
+            for lkey, rkey in zip(join.left_on, join.right_on, strict=True):
+                missing = set(left[lkey].drop_nulls().to_list()) - set(right[rkey].drop_nulls().to_list())
+                assert not missing, f"{table.input_prefix}.{lkey} -> {join.input_prefix}.{rkey}"
+
+
+def test_a_table_joining_two_targets_resolves_both(tmp_path):
+    """MEDS-Extract 0.8 lets one table join several targets; every one of them must resolve."""
+    cfg = MessyConfig.parse(
+        {
+            "etl": {"dataset_name": "MultiJoin", "raw_dataset_version": "1"},
+            "stays": {"_defaults": {"subject_id": "$pid"}, "s": {"code": "STAY", "time": None}},
+            "admissions": {"_defaults": {"subject_id": "$pid"}, "a": {"code": "ADM", "time": None}},
+            "labs": {
+                "_defaults": {"subject_id": "$pid"},
+                "_table": {
+                    "joins": {
+                        "stays": {"key": "stay_id", "cols": ["unit"]},
+                        "admissions": {"key": "hadm_id", "cols": ["dischtime"]},
+                    },
+                },
+                "lab": {"code": 'f"LAB//{$unit}"', "time": '$dischtime::"%Y-%m-%d %H:%M:%S"'},
+            },
+        }
+    )
+    labs = next(t for t in cfg.event_tables if t.input_prefix == "labs")
+    assert [j.input_prefix for j in table_joins(labs)] == ["stays", "admissions"]
+
+    dataset = generate(cfg, GenerationOptions(seed=0, n_subjects=16))
+    left = dataset.frames["labs"]
+    for target, key in (("stays", "stay_id"), ("admissions", "hadm_id")):
+        right = set(dataset.frames[target][key].drop_nulls().to_list())
+        assert set(left[key].drop_nulls().to_list()) <= right, target
+
+    result = synthesize(cfg, tmp_path, n_subjects=16, seed=0)
+    assert result.ok, [str(f) for f in result.findings]
 
 
 def test_metadata_dictionary_covers_the_event_vocabulary(features_cfg):
@@ -240,7 +272,7 @@ def test_a_config_meds_extract_rejects_is_reported_not_raised(tmp_path):
                 "etl": {"dataset_name": "Broken", "raw_dataset_version": "1"},
                 "ops": {
                     "_defaults": {"subject_id": "$pid"},
-                    "_table": {"join": {"ops": {"key": "pid", "cols": {"age": "min"}}}},
+                    "_table": {"joins": {"ops": {"key": "pid", "cols": {"age": "min"}}}},
                     "e": {"code": "X", "time": None},
                 },
             }
@@ -263,7 +295,7 @@ FANOUT_CONFIG = {
         "admit": {"code": "ADMIT", "time": '$admittime::"%Y-%m-%d"'},
     },
     "diagnoses": {
-        "_table": {"join": {"admissions": {"key": "hadm_id", "cols": ["dischtime"]}}},
+        "_table": {"joins": {"admissions": {"key": "hadm_id", "cols": ["dischtime"]}}},
         "dx": {"code": 'f"DX//{$icd}"', "time": '$dischtime::"%Y-%m-%d"'},
     },
 }

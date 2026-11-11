@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MESSY_synth#license)
 
 **Generate synthetic raw data that matches the shape a [MEDS-Extract](https://github.com/mmcdermott/MEDS_extract)
-v0.7 MESSY config expects — then run the whole ETL over it, with no access to the real dataset.**
+v0.7 or v0.8 MESSY config expects — then run the whole ETL over it, with no access to the real dataset.**
 
 A MESSY file is a complete, config-only ETL. It declares where the raw data comes from and how each
 raw table becomes MEDS events, written in the [dftly](https://github.com/mmcdermott/dftly)
@@ -134,7 +134,7 @@ that must agree, and each group gets a single shared value pool.
 Expectations flow *down* the dftly AST from each MEDS output slot — `time` must yield a timestamp,
 `numeric_value` a number, `code` a string — and each node says how its own expectation constrains
 its children. Column references are not always leaves: a `_table.cols` name is expanded in place,
-and a name pulled in by `_table.join` is attributed to the table it actually lives in.
+and a name pulled in by `_table.joins` is attributed to the table it actually lives in.
 
 ```python
 >>> from MESSY_synth import infer_constraints
