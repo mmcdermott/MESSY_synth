@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="MESSY-synth",
         description=(
-            "Generate synthetic raw source data matching the structure a MEDS-Extract v0.7 "
+            "Generate synthetic raw source data matching the structure a MEDS-Extract v0.8 "
             "MESSY config expects. All generated values are fake; only the shape is real."
         ),
     )

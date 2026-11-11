@@ -214,14 +214,12 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
         for sid in subject_ids
     }
 
-    joins = {t.input_prefix: t.join for t in cfg.event_tables if t.join is not None}
+    joins = {t.input_prefix: t.joins for t in cfg.event_tables if t.joins}
     frames: dict[str, pl.DataFrame] = {}
     truncated: dict[str, int] = {}
     for table in _generation_order(plan, joins):
         frame = _generate_table(table, plan, pools, timelines, subject_ids, options, truncated)
-        join = joins.get(table.prefix)
-        if join is not None and join.input_prefix in frames:
-            frame = _adopt_join_keys(frame, table, join, frames[join.input_prefix], options)
+        frame = _adopt_join_keys(frame, table, joins.get(table.prefix, ()), frames, options)
         frames[table.prefix] = frame
     return GeneratedDataset(plan=plan, frames=frames, timelines=timelines, truncated_metadata=truncated)
 
@@ -272,7 +270,7 @@ def _generation_order(plan: DatasetPlan, joins: dict) -> list[TablePlan]:
 
     Args:
         plan: The dataset plan.
-        joins: Table prefix to its :class:`~MEDS_extract.config.JoinConfig`.
+        joins: Table prefix to its tuple of :class:`~MEDS_extract.config.JoinConfig` objects.
 
     Returns:
         The table plans in dependency order. A cycle (which MEDS-Extract rejects for self-joins,
@@ -285,8 +283,7 @@ def _generation_order(plan: DatasetPlan, joins: dict) -> list[TablePlan]:
     def visit(prefix: str, seen: frozenset[str]) -> None:
         if prefix in placed or prefix in seen or prefix not in by_prefix:
             return
-        join = joins.get(prefix)
-        if join is not None:
+        for join in joins.get(prefix, ()):
             visit(join.input_prefix, seen | {prefix})
         if prefix not in placed:
             placed.add(prefix)
@@ -300,11 +297,11 @@ def _generation_order(plan: DatasetPlan, joins: dict) -> list[TablePlan]:
 def _adopt_join_keys(
     frame: pl.DataFrame,
     table: TablePlan,
-    join,
-    target: pl.DataFrame,
+    joins: tuple,
+    frames: dict[str, pl.DataFrame],
     options: GenerationOptions,
 ) -> pl.DataFrame:
-    """Replace a table's join-key columns with real key tuples drawn from the target's frame.
+    """Replace a table's join-key columns with real key tuples drawn from each target's frame.
 
     Generating the two sides independently is not good enough for a composite key: each column
     might individually come from the right pool while the *combination* exists nowhere on the far
@@ -315,29 +312,37 @@ def _adopt_join_keys(
     universe, and overwriting it would break the round-robin assignment that gives every subject a
     row — and, in a subject-level table, would put two rows on one subject.
 
+    A table with several joins adopts from each target in turn, drawing from one random stream, so a
+    single-join table draws exactly what it did before multi-join support.
+
     Args:
         frame: The freshly generated frame.
         table: Its plan.
-        join: The table's join config.
-        target: The already-generated frame of the join target.
+        joins: The table's join configs, in the order MEDS-Extract applies them.
+        frames: The frames generated so far, by prefix. A target that is not among them (a cycle)
+            is skipped.
         options: The generation options, for the seed.
 
     Returns:
         The frame with its join keys adopted from the target.
     """
-    pairs = [
-        (left, right)
-        for left, right in zip(join.left_on, join.right_on, strict=True)
-        if left != table.subject_column and left in frame.columns and right in target.columns
-    ]
-    if not pairs or target.height == 0:
-        return frame
-
     rng = random.Random(f"{options.seed}:joinkeys:{table.prefix}")
-    picks = [rng.randrange(target.height) for _ in range(frame.height)]
-    return frame.with_columns(
-        *(target[right].gather(picks).alias(left) for left, right in pairs),
-    )
+    for join in joins:
+        target = frames.get(join.input_prefix)
+        if target is None or target.height == 0:
+            continue
+        pairs = [
+            (left, right)
+            for left, right in zip(join.left_on, join.right_on, strict=True)
+            if left != table.subject_column and left in frame.columns and right in target.columns
+        ]
+        if not pairs:
+            continue
+        picks = [rng.randrange(target.height) for _ in range(frame.height)]
+        frame = frame.with_columns(
+            *(target[right].gather(picks).alias(left) for left, right in pairs),
+        )
+    return frame
 
 
 def _materialize_pools(plan: DatasetPlan, options: GenerationOptions) -> dict[str, list]:

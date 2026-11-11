@@ -8,7 +8,7 @@ dynamic = ["version"] # Makes setuptools-scm manage the version
 authors = [
   {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
 ]
-description = "Generate structurally-faithful synthetic raw data from any MEDS-Extract v0.7 MESSY config."
+description = "Generate structurally-faithful synthetic raw data from any MEDS-Extract v0.8 MESSY config."
 readme = "README.md"
 requires-python = ">=3.12"
 classifiers = [
@@ -17,9 +17,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-  # 0.7.0 is the first release with the single-file MESSY config and the
-  # `MessyConfig`/`TableConfig`/`EventConfig` API this package reflects over.
-  "MEDS-extract>=0.7.0,<0.8",
+  # 0.8.0 renamed `_table.join` to `_table.joins` (several joins per table), the form this
+  # package reflects over via `TableConfig.joins`.
+  "MEDS-extract>=0.8.0,<0.9",
   # The expression DSL whose AST we walk to infer column types. Pulled in
   # transitively by MEDS-extract, but imported directly here, so declared direct.
   "dftly>=0.7.0,<0.8",
