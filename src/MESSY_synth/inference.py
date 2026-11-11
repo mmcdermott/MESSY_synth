@@ -299,6 +299,71 @@ def _infer_table(table: TableConfig, cs: ConstraintSet) -> None:
                 )
 
 
+def event_column_references(cfg: MessyConfig, by_slot: bool = False) -> dict[tuple[str, str], object]:
+    """Map each event to the raw source columns its expressions read.
+
+    ``_table.cols`` names are expanded to the columns they are computed from, and joined columns
+    are attributed to the join target's file, as in :func:`infer_constraints`.
+
+    Args:
+        cfg: A parsed MESSY config.
+        by_slot: Whether to break each event's references down by output slot.
+
+    Returns:
+        ``(table_prefix, event_name)`` mapped to a set of ``(source_prefix, column)``, or with
+        ``by_slot``, to a mapping of slot name to such a set.
+
+    Examples:
+        >>> from MEDS_extract.config import MessyConfig
+        >>> cfg = MessyConfig.parse({
+        ...     "labs": {
+        ...         "_defaults": {"subject_id": "$pid"},
+        ...         "_table": {"cols": {"_t": 'f"{$date} {$clock}"::?"%Y-%m-%d %H:%M"'}},
+        ...         "lab": {"code": "LAB", "time": "$_t", "numeric_value": "$value"},
+        ...     },
+        ... })
+        >>> sorted(event_column_references(cfg)[("labs", "lab")])
+        [('labs', 'clock'), ('labs', 'date'), ('labs', 'value')]
+        >>> event_column_references(cfg, by_slot=True)[("labs", "lab")]["numeric_value"]
+        {('labs', 'value')}
+    """
+    out: dict[tuple[str, str], object] = {}
+    for table in cfg.event_tables:
+        ctx = _Context(prefix=table.input_prefix, derived=dict(table.cols), join=table.join)
+        for event in table.events:
+            slots: dict[str, set[tuple[str, str]]] = {}
+            for slot, node in event.columns.items():
+                slots[slot] = set()
+                _collect_columns(node, ctx, slots[slot], frozenset())
+            key = (table.input_prefix, event.name)
+            out[key] = slots if by_slot else set().union(*slots.values())
+    return out
+
+
+def _collect_columns(node: object, ctx: _Context, refs: set[tuple[str, str]], seen: frozenset[str]) -> None:
+    """Add every raw column reference beneath ``node`` to ``refs``.
+
+    Args:
+        node: The node (or nested container of nodes) to walk.
+        ctx: The resolving context.
+        refs: The accumulator.
+        seen: Derived names already being expanded, for cycle safety.
+    """
+    if isinstance(node, Column):
+        name = node.args[0]
+        if name in ctx.derived:
+            if name not in seen:
+                _collect_columns(ctx.derived[name], ctx, refs, seen | {name})
+            return
+        refs.add((ctx.owner_of(name), name))
+    elif isinstance(node, NodeBase):
+        _collect_columns(node.args, ctx, refs, seen)
+        _collect_columns(list(node.kwargs.values()), ctx, refs, seen)
+    elif isinstance(node, list | tuple):
+        for item in node:
+            _collect_columns(item, ctx, refs, seen)
+
+
 def _infer_metadata(cfg: MessyConfig, cs: ConstraintSet) -> None:
     """Collect constraints for every ``_metadata`` dictionary file.
 
