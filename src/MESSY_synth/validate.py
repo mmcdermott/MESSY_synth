@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,6 +32,7 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from .constraints import ValueKind
+from .plan import DEFAULT_CSV_SEPARATOR, config_csv_separator, source_separator
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Iterable
@@ -326,8 +328,59 @@ def dry_run(cfg: MessyConfig, input_dir: str | Path) -> pl.DataFrame:
         Two rows of twenty are lost to the deliberate nulls injected into ``itemid``: under 0.7 a
         null component null-propagates through the interpolated code and the row is dropped. That
         path is worth exercising, which is why nulls are generated at all.
+
+        Sources split on a separator other than ``","`` (``etl.csv_separator``, MEDS-Extract 0.9) are
+        read through parquet copies, the way ``convert_to_parquet`` reads them before every other
+        stage; see :func:`_read_separated_sources`.
     """
     input_dir = Path(input_dir)
+    separator = config_csv_separator(cfg)
+    if separator != DEFAULT_CSV_SEPARATOR:
+        with tempfile.TemporaryDirectory() as staged:
+            return _dry_run(cfg, _read_separated_sources(input_dir, separator, Path(staged)))
+    return _dry_run(cfg, input_dir)
+
+
+def _read_separated_sources(input_dir: Path, separator: str | dict[str, str], staged: Path) -> Path:
+    """Stage ``input_dir`` with every non-comma csv source converted to parquet.
+
+    MEDS-Extract's table scans read csv with ``","``; only ``convert_to_parquet`` (and
+    ``extract_code_metadata``) honor ``etl.csv_separator``, and every later stage reads the parquet
+    the first one writes, which matches ``pl.read_csv(src, infer_schema_length=None)``. Every other
+    source file is linked into ``staged`` as is.
+
+    Args:
+        input_dir: The directory holding the generated sources, one file per prefix.
+        separator: The config's ``etl.csv_separator``.
+        staged: An empty directory to stage into.
+
+    Returns:
+        ``staged``.
+    """
+    for src in sorted(p for p in input_dir.rglob("*") if p.is_file()):
+        rel = src.relative_to(input_dir)
+        suffix = next((s for s in (".csv.gz", ".csv") if src.name.endswith(s)), None)
+        dest = staged / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        sep = source_separator(separator, rel.as_posix()[: -len(suffix)]) if suffix else None
+        if sep is None or sep == DEFAULT_CSV_SEPARATOR:
+            dest.symlink_to(src.resolve())
+            continue
+        frame = pl.read_csv(src, separator=sep, infer_schema_length=None)
+        frame.write_parquet(dest.with_name(dest.name[: -len(suffix)] + ".parquet"))
+    return staged
+
+
+def _dry_run(cfg: MessyConfig, input_dir: Path) -> pl.DataFrame:
+    """Run :func:`dry_run` over sources MEDS-Extract's table scans can read as they are.
+
+    Args:
+        cfg: The parsed MESSY config.
+        input_dir: Directory holding the source files.
+
+    Returns:
+        The per-event table :func:`dry_run` documents.
+    """
     rows: list[dict] = []
     for table in cfg.event_tables:
         try:

@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg?labelColor=gray)](https://github.com/mmcdermott/MESSY_synth#license)
 
 **Generate synthetic raw data that matches the shape a [MEDS-Extract](https://github.com/mmcdermott/MEDS_extract)
-v0.8 MESSY config expects — then run the whole ETL over it, with no access to the real dataset.**
+0.8 or 0.9 MESSY config expects — then run the whole ETL over it, with no access to the real dataset.**
 
 A MESSY file is a complete, config-only ETL. It declares where the raw data comes from and how each
 raw table becomes MEDS events, written in the [dftly](https://github.com/mmcdermott/dftly)
@@ -36,8 +36,16 @@ That gets you two things:
 pip install MESSY_synth # or: uv add MESSY_synth
 ```
 
-MESSY_synth 0.1 reads MEDS-Extract 0.8 configs (`_table.joins`). For MEDS-Extract 0.7 configs, use
-`MESSY_synth==0.0.1`.
+MESSY_synth reads MEDS-Extract 0.8 and 0.9 configs (`_table.joins`); the MESSY format is the same
+in both. For MEDS-Extract 0.7 configs, use `MESSY_synth==0.0.1`.
+
+Two MEDS-Extract 0.9 changes shape the generated data:
+
+- **`etl.csv_separator`.** CSV sources are written with the separator the config gives each prefix,
+    so the ETL reads them the way it reads the real files.
+- **One `unit` per code.** MEDS-Extract 0.9 fails a run when the rows of one code carry distinct
+    `unit` metadata. A `_self: {unit: ...}` column the code does not spell is therefore generated
+    with one value per rendered code.
 
 Or for development:
 
@@ -59,7 +67,7 @@ meds-extract-run spec=./path/to/messy.yaml output_dir=meds_out/ \
 	do_download=false input_dir=raw_synthetic/
 ```
 
-Give the config as `./path` or an absolute path: MEDS-Extract 0.8 reads a bare `path/to/messy.yaml`
+Give the config as `./path` or an absolute path: MEDS-Extract reads a bare `path/to/messy.yaml`
 as the name of a registered pipeline. A registered name (`HIRID`) works too.
 
 If the spec has a pre-MEDS stage that converts the raw download into the tables the config reads
