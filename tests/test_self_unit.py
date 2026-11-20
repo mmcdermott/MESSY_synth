@@ -41,6 +41,7 @@ def _units_per_group(frame: pl.DataFrame, keys: list[str], unit: str) -> int:
 
 
 def test_a_self_unit_outside_the_code_is_one_unit_per_code():
+    """A unit column the code does not read gets one value per code, nulls kept."""
     cfg = MessyConfig.parse(
         _config(
             {
@@ -60,7 +61,8 @@ def test_a_self_unit_outside_the_code_is_one_unit_per_code():
     assert labs["valueuom"].n_unique() > 2
 
 
-def test_a_code_built_through_a_join_groups_by_the_join_key():
+def test_a_code_built_through_a_join_groups_by_the_joined_label():
+    """A code rendered from a joined label has one unit across every key sharing the label."""
     cfg = MessyConfig.parse(
         _config(
             {
@@ -100,6 +102,7 @@ def test_a_unit_spelled_in_the_code_is_left_alone():
 
 @pytest.mark.slow
 def test_the_etl_accepts_a_self_unit_outside_the_code(tmp_path):
+    """MEDS-Extract 0.9 builds the cohort instead of rejecting several units per code."""
     spec = _config(
         {
             "lab": {

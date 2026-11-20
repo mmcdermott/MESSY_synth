@@ -54,6 +54,7 @@ def _header(path) -> str:
 
 
 def test_every_csv_is_written_with_the_separator(tmp_path):
+    """One separator splits every csv file, and the dry run still sees every event."""
     result = synthesize(_parse(_config(";")), tmp_path, seed=0, null_fraction=0.0)
     assert result.fmt == "csv"
     assert set(result.files) == {"patients", "labs", "stays", "d_labitems"}
@@ -66,6 +67,7 @@ def test_every_csv_is_written_with_the_separator(tmp_path):
 
 
 def test_a_per_prefix_separator_leaves_unlisted_prefixes_comma_separated(tmp_path):
+    """A mapping sets the listed prefixes' separators; the others stay ``","``."""
     result = synthesize(_parse(_config({"labs": "\t", "d_labitems": "|"})), tmp_path, seed=0)
     assert "\t" in _header(result.files["labs"])
     assert "|" in _header(result.files["d_labitems"])
@@ -76,6 +78,7 @@ def test_a_per_prefix_separator_leaves_unlisted_prefixes_comma_separated(tmp_pat
 
 @pytest.mark.slow
 def test_the_etl_reads_the_separated_files(tmp_path):
+    """``meds-extract-run`` builds a described cohort from three differently separated files."""
     spec = _config({"labs": ";", "stays": "\t", "d_labitems": "|"})
     _parse(spec)
     fp = tmp_path / "messy.yaml"
