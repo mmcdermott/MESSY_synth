@@ -11,7 +11,9 @@ Choosing the format is not purely cosmetic. MEDS-Extract type-infers CSV sources
 that uses a column directly as a timestamp (``time: $Offset``, as SICdb does over its pre-MEDS
 output) therefore needs a format that carries real dtypes. The default ``"auto"`` detects exactly
 that case and writes parquet for the whole dataset, and CSV otherwise, so the common case stays
-human-readable while the dtype-dependent case still runs.
+human-readable while the dtype-dependent case still runs. CSV is written with the field separator the
+config's ``etl.csv_separator`` (MEDS-Extract 0.9) gives each prefix, so MEDS-Extract splits it the way
+the real sources are split.
 """
 
 from __future__ import annotations
@@ -78,7 +80,7 @@ def needs_real_dtypes(plan: DatasetPlan) -> bool:
     )
 
 
-def csv_would_retype(frame: pl.DataFrame) -> bool:
+def csv_would_retype(frame: pl.DataFrame, separator: str = ",") -> bool:
     """Return whether a CSV round-trip would change any of ``frame``'s dtypes.
 
     MEDS-Extract type-infers CSV sources exactly as ``pl.read_csv`` does, and that inference is
@@ -93,6 +95,7 @@ def csv_would_retype(frame: pl.DataFrame) -> bool:
 
     Args:
         frame: The frame that would be written.
+        separator: The field separator it would be written and read with.
 
     Returns:
         True if any column's dtype would change.
@@ -114,7 +117,9 @@ def csv_would_retype(frame: pl.DataFrame) -> bool:
     if frame.height == 0:
         return False
     try:
-        restored = pl.read_csv(frame.write_csv().encode(), infer_schema_length=None)
+        restored = pl.read_csv(
+            frame.write_csv(separator=separator).encode(), infer_schema_length=None, separator=separator
+        )
     except Exception:  # pragma: no cover - defensive; a frame we cannot round-trip is not csv-safe
         return True
     return dict(restored.schema) != dict(frame.schema)
@@ -169,7 +174,9 @@ def resolve_format(
     if needs_real_dtypes(plan):
         return "parquet"
     if frames and any(
-        csv_would_retype(frame) for prefix, frame in frames.items() if not plan.table(prefix).is_metadata
+        csv_would_retype(frame, plan.separator(prefix))
+        for prefix, frame in frames.items()
+        if not plan.table(prefix).is_metadata
     ):
         return "parquet"
     return "csv"
@@ -235,9 +242,9 @@ def write_dataset(
         elif resolved == "csv.gz":
             # polars does not infer compression from the extension — it raises if the name implies
             # one and `compression` does not say so.
-            frame.write_csv(path, compression="gzip")
+            frame.write_csv(path, compression="gzip", separator=dataset.plan.separator(table.prefix))
         else:
-            frame.write_csv(path)
+            frame.write_csv(path, separator=dataset.plan.separator(table.prefix))
         written[table.prefix] = path
         logger.info(f"Wrote {frame.height} rows x {frame.width} cols to {path}")
 

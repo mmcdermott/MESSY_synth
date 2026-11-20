@@ -22,14 +22,17 @@ from __future__ import annotations
 import itertools
 import logging
 import random
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
 
 from .constraints import ColumnConstraint, ValueKind
+from .inference import _collect_columns, _Context, _parse
 from .plan import (
     DEFAULT_ROWS_PER_SUBJECT,
     DEFAULT_VOCAB_SIZE,
@@ -224,7 +227,123 @@ def generate(cfg: MessyConfig, options: GenerationOptions | None = None) -> Gene
             frame, table, joins.get(table.prefix, ()), frames, options, derived.get(table.prefix, {})
         )
         frames[table.prefix] = frame
+    for table_cfg in cfg.event_tables:
+        if table_cfg.input_prefix in frames:
+            frames[table_cfg.input_prefix] = _one_unit_per_code(
+                frames[table_cfg.input_prefix],
+                table_cfg,
+                frames,
+                plan.table(table_cfg.input_prefix).subject_column,
+            )
     return GeneratedDataset(plan=plan, frames=frames, timelines=timelines, truncated_metadata=truncated)
+
+
+def _one_unit_per_code(
+    frame: pl.DataFrame, table_cfg, frames: dict[str, pl.DataFrame], subject_column: str | None
+) -> pl.DataFrame:
+    """Give every code one ``_self`` ``unit``, as MEDS-Extract 0.9 requires.
+
+    MEDS-Extract 0.9 writes a code's ``unit`` metadata as one String and fails the run when the
+    rows of one code carry distinct units. A ``_self: {unit: ...}`` block reads the unit off the
+    event's own rows, so a unit column drawn independently per row gives each code several units.
+    Each such column therefore takes, within each code the event renders, that code's first
+    non-null value; nulls stay where they were drawn. The codes are rendered as MEDS-Extract renders
+    them (joins applied, ``_table.cols`` derived), so a code built from a joined label groups every
+    key that shares the label.
+
+    A column some event's code reads is left as is: a code that spells its unit has one unit per
+    code already, and rewriting a code component would change the codes. So are subject-id and
+    join-key columns, and columns that arrive through a join.
+
+    Args:
+        frame: The table's generated frame, join keys already adopted.
+        table_cfg: The table's :class:`~MEDS_extract.config.TableConfig`.
+        frames: Every generated frame so far; the table's join targets are among them.
+        subject_column: The table's subject-id column, if any.
+
+    Returns:
+        The frame, with each such unit column rewritten.
+
+    Examples:
+        >>> from MEDS_extract.config import MessyConfig
+        >>> cfg = MessyConfig.parse({"labs": {
+        ...     "_defaults": {"subject_id": "$pid"},
+        ...     "lab": {"code": 'f"LAB//{$itemid}"', "time": None, "_metadata": {"_self": {"unit": "$uom"}}},
+        ... }})
+        >>> frame = pl.DataFrame({"pid": [1, 2, 3, 4], "itemid": ["a", "a", "b", "b"],
+        ...                       "uom": [None, "mg", "g", "kg"]})
+        >>> _one_unit_per_code(frame, cfg.event_tables[0], {}, "pid")["uom"].to_list()
+        [None, 'mg', 'g', 'g']
+    """
+    prefix = table_cfg.input_prefix
+    ctx = _Context(prefix=prefix, derived=dict(table_cfg.cols), joins=table_cfg.joins)
+
+    def local_columns(node: object) -> set[str]:
+        refs: set[tuple[str, str]] = set()
+        _collect_columns(node, ctx, refs, frozenset())
+        return {col for owner, col in refs if owner == prefix}
+
+    units: list[tuple[object, set[str]]] = []
+    for event in table_cfg.events:
+        unit = (event.metadata.get("_self") or {}).get("unit")
+        node = _parse(unit) if unit is not None else None
+        if node is not None:
+            units.append((event, local_columns(node)))
+    if not units:
+        return frame
+
+    fixed = {subject_column} | set().union(*(local_columns(e.columns["code"]) for e in table_cfg.events))
+    for join in table_cfg.joins:
+        for left in join.left_on:
+            fixed |= local_columns(_parse(f"${left}"))
+    units = [(event, {c for c in cols - fixed if c in frame.columns}) for event, cols in units]
+    units = [(event, cols) for event, cols in units if cols]
+    if not units:
+        return frame
+
+    code_cols = [f"__MESSY_synth_code_{i}" for i in range(len(units))]
+    try:
+        with tempfile.TemporaryDirectory() as staged:
+            for join in table_cfg.joins:
+                target_fp = Path(staged) / f"{join.input_prefix}.parquet"
+                target_fp.parent.mkdir(parents=True, exist_ok=True)
+                frames[join.input_prefix].write_parquet(target_fp)
+            row = "__MESSY_synth_row"
+            codes = (
+                table_cfg.prepare(table_cfg.apply_join(frame.with_row_index(row).lazy(), Path(staged)))
+                .select(
+                    row,
+                    *(
+                        e.columns["code"].polars_expr.cast(pl.String).alias(c)
+                        for (e, _), c in zip(units, code_cols, strict=True)
+                    ),
+                )
+                .collect()
+                .sort(row)
+                .drop(row)
+            )
+    except Exception as e:  # The dry run reports a config whose codes cannot be rendered.
+        logger.warning(f"{prefix}: could not render codes to give each one _self unit: {e}")
+        return frame
+    if codes.height != frame.height:
+        return frame
+
+    work = frame.hstack(codes)
+    # A unit column shared by events with different codes must be one per code for each of them;
+    # alternating passes converge to one value per connected group of codes.
+    for _ in range(max(1, 2 * len(units))):
+        before = work
+        for (_, cols), code in zip(units, code_cols, strict=True):
+            work = work.with_columns(
+                pl.when(pl.col(col).is_not_null() & pl.col(code).is_not_null())
+                .then(pl.col(col).drop_nulls().first().over(code))
+                .otherwise(pl.col(col))
+                .alias(col)
+                for col in sorted(cols)
+            )
+        if work.equals(before):
+            break
+    return work.drop(code_cols)
 
 
 def _validate_column_generators(

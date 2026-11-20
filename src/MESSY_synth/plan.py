@@ -52,6 +52,9 @@ DEFAULT_VOCAB_SIZE = 8
 #: Upper bound on the Cartesian product used to populate a multi-key metadata dictionary.
 MAX_METADATA_ROWS = 512
 
+#: The field separator MEDS-Extract reads csv sources with unless ``etl.csv_separator`` names another.
+DEFAULT_CSV_SEPARATOR = ","
+
 
 class UnionFind:
     """A minimal union-find over hashable keys, used to group columns that share a value pool.
@@ -198,12 +201,38 @@ class DatasetPlan:
         n_subjects: The size of the shared subject universe.
         tables: Every file to write.
         pools: Value pools keyed by pool id.
+        csv_separator: The config's ``etl.csv_separator`` (MEDS-Extract 0.9): the field separator
+            csv sources are read with, as one character or a mapping of source prefix to one.
     """
 
     dataset_name: str
     n_subjects: int
     tables: tuple[TablePlan, ...]
     pools: dict[str, ValuePool] = field(default_factory=dict)
+    csv_separator: str | dict[str, str] = DEFAULT_CSV_SEPARATOR
+
+    def separator(self, prefix: str) -> str:
+        """Return the field separator MEDS-Extract reads csv source ``prefix`` with.
+
+        Resolved as MEDS-Extract resolves ``etl.csv_separator``: one separator for every source, or
+        a mapping under which a prefix it does not list keeps the default ``","``.
+
+        Args:
+            prefix: The table prefix.
+
+        Returns:
+            One single-byte character.
+
+        Examples:
+            >>> DatasetPlan("D", 1, ()).separator("labs")
+            ','
+            >>> DatasetPlan("D", 1, (), csv_separator=";").separator("labs")
+            ';'
+            >>> plan = DatasetPlan("D", 1, (), csv_separator={"labs": "|"})
+            >>> plan.separator("labs"), plan.separator("items")
+            ('|', ',')
+        """
+        return source_separator(self.csv_separator, prefix)
 
     def table(self, prefix: str) -> TablePlan:
         """Look up one table plan by prefix.
@@ -341,6 +370,7 @@ def build_plan(
         n_subjects=n_subjects,
         tables=tuple(sorted(tables, key=lambda t: t.prefix)),
         pools=pools,
+        csv_separator=config_csv_separator(cfg),
     )
 
 
@@ -370,6 +400,45 @@ def _dataset_name(cfg: MessyConfig) -> str:
         return cfg.dataset_name
     except ValueError:
         return "synthetic"
+
+
+def config_csv_separator(cfg: MessyConfig) -> str | dict[str, str]:
+    """Return the config's ``etl.csv_separator``, or ``","`` if it sets none.
+
+    MEDS-Extract 0.9 added the option; 0.8 rejects it when parsing, so a 0.8 config never has one.
+
+    Args:
+        cfg: The parsed MESSY config.
+
+    Returns:
+        One separator, or a mapping of source prefix to one.
+
+    Examples:
+        >>> from MEDS_extract.config import MessyConfig
+        >>> config_csv_separator(MessyConfig.parse({"t": {"e": {"code": "X", "time": None}}}))
+        ','
+    """
+    separator = (cfg.etl.stage_options or {}).get("csv_separator", DEFAULT_CSV_SEPARATOR)
+    return separator if isinstance(separator, str) else dict(separator)
+
+
+def source_separator(separator: str | dict[str, str], prefix: str) -> str:
+    """Resolve an ``etl.csv_separator`` value for one source prefix, as MEDS-Extract does.
+
+    Args:
+        separator: One separator for every source, or a mapping of source prefix to one.
+        prefix: The source prefix.
+
+    Returns:
+        The separator ``prefix`` is read with; a prefix a mapping does not list keeps ``","``.
+
+    Examples:
+        >>> source_separator(";", "labs"), source_separator({"labs": ";"}, "items")
+        (';', ',')
+    """
+    if isinstance(separator, str):
+        return separator
+    return separator.get(prefix, DEFAULT_CSV_SEPARATOR)
 
 
 @dataclass
